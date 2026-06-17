@@ -69,7 +69,13 @@ chmod 750 "$CONFIG_DIR"
 # ── Copy files ─────────────────────────────────────────────
 log "Installing application files to $INSTALL_DIR…"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp -r "$SCRIPT_DIR"/app.py "$SCRIPT_DIR"/daemon.py "$SCRIPT_DIR"/templates "$INSTALL_DIR"/
+REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+
+if [[ ! -f "$REPO_ROOT/app.py" ]]; then
+  err "Could not find app.py at $REPO_ROOT — run this script from inside the cloned repo (e.g. 'sudo bash scripts/install.sh')"
+fi
+
+cp -r "$REPO_ROOT"/app.py "$REPO_ROOT"/daemon.py "$REPO_ROOT"/templates "$INSTALL_DIR"/
 
 # ── Python venv ────────────────────────────────────────────
 log "Creating Python virtual environment…"
