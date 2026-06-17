@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pritunl Port Forward Manager</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --surface2:  #1c2330;
+      --border:    #30363d;
+      --accent:    #238636;
+      --accent2:   #1f6feb;
+      --danger:    #da3633;
+      --warn:      #d29922;
+      --text:      #c9d1d9;
+      --muted:     #8b949e;
+      --green:     #3fb950;
+      --red:       #f85149;
+      --blue:      #58a6ff;
+      --purple:    #bc8cff;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Header ── */
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+      height: 56px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+      font-size: 15px;
+      color: var(--text);
+      text-decoration: none;
+    }
+    .logo-icon {
+      width: 28px; height: 28px;
+      background: var(--accent2);
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+    .status-dot.ok   { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .status-dot.warn { background: var(--warn); }
+    .status-dot.err  { background: var(--red); }
+
+    /* ── Layout ── */
+    main { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
+
+    /* ── Stats bar ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 28px;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+    }
+    .stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+    .stat-value { font-size: 26px; font-weight: 700; color: var(--text); margin-top: 4px; }
+    .stat-value.green { color: var(--green); }
+    .stat-value.blue  { color: var(--blue); }
+
+    /* ── Card ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }
+    .card-header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .card-title { font-weight: 600; font-size: 14px; }
+    .card-body  { padding: 20px; }
+
+    /* ── Form ── */
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+      align-items: end;
+    }
+    .form-group label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      margin-bottom: 6px;
+    }
+    .form-group select,
+    .form-group input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 7px 10px;
+      border-radius: 6px;
+      font-size: 13px;
+      transition: border-color .15s;
+    }
+    .form-group select:focus,
+    .form-group input:focus {
+      outline: none;
+      border-color: var(--accent2);
+    }
+    .form-actions {
+      display: flex;
+      align-items: flex-end;
+      gap: 8px;
+    }
+
+    /* ── Buttons ── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 7px 14px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      transition: opacity .15s, background .15s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn-primary  { background: var(--accent);  color: #fff; border-color: var(--accent); }
+    .btn-secondary{ background: var(--surface2); color: var(--text); border-color: var(--border); }
+    .btn-danger   { background: transparent; color: var(--red); border-color: transparent; padding: 4px 8px; }
+    .btn-sm       { padding: 4px 10px; font-size: 12px; }
+
+    /* ── Table ── */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      padding: 10px 14px;
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .5px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--surface2); }
+    .empty-row td {
+      text-align: center;
+      color: var(--muted);
+      padding: 40px;
+    }
+
+    /* ── Badges ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .badge-green  { background: rgba(63,185,80,.15);  color: var(--green); }
+    .badge-red    { background: rgba(248,81,73,.15);   color: var(--red); }
+    .badge-blue   { background: rgba(88,166,255,.15);  color: var(--blue); }
+    .badge-purple { background: rgba(188,140,255,.15); color: var(--purple); }
+    .badge-yellow { background: rgba(210,153,34,.15);  color: var(--warn); }
+
+    .port-arrow { color: var(--muted); margin: 0 4px; }
+    .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
+
+    /* ── Inline edit ── */
+    .edit-input {
+      background: var(--bg);
+      border: 1px solid var(--accent2);
+      color: var(--text);
+      padding: 3px 6px;
+      border-radius: 4px;
+      font-size: 13px;
+      width: 70px;
+    }
+
+    /* ── Alert ── */
+    .alert {
+      padding: 10px 14px;
+      border-radius: 6px;
+      margin-top: 12px;
+      font-size: 13px;
+      display: none;
+    }
+    .alert.show   { display: block; }
+    .alert-error  { background: rgba(218,54,51,.15); border: 1px solid var(--danger); color: #fca5a5; }
+    .alert-success{ background: rgba(35,134,54,.15); border: 1px solid var(--accent); color: #86efac; }
+
+    /* ── Modal ── */
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.7);
+      display: none; align-items: center; justify-content: center;
+      z-index: 200;
+    }
+    .modal-overlay.show { display: flex; }
+    .modal {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 24px;
+      width: 380px;
+      max-width: 95vw;
+    }
+    .modal h3 { margin-bottom: 16px; font-size: 15px; }
+    .modal .form-group { margin-bottom: 14px; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+
+    /* ── Topnav links ── */
+    .nav-link {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition: color .15s, background .15s;
+    }
+    .nav-link:hover { color: var(--text); background: var(--surface2); }
+
+    @media (max-width: 600px) {
+      .form-grid { grid-template-columns: 1fr 1fr; }
+      .stats-grid { grid-template-columns: 1fr 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <a class="logo" href="/">
+    <span class="logo-icon">⟢</span>
+    Port Forward Manager
+  </a>
+  <div class="header-actions">
+    <div class="status-pill" id="mongo-status">
+      <span class="status-dot" id="mongo-dot"></span>
+      <span id="mongo-label">MongoDB</span>
+    </div>
+    <button class="btn btn-secondary btn-sm" onclick="openPasswordModal()">⚙ Password</button>
+    <a class="nav-link" href="/logout">Logout</a>
+  </div>
+</header>
+
+<main>
+
+  <!-- Stats -->
+  <div class="stats-grid" id="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total Rules</div>
+      <div class="stat-value" id="stat-total">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Active Forwards</div>
+      <div class="stat-value green" id="stat-active">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Clients Online</div>
+      <div class="stat-value blue" id="stat-clients">–</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Last Refresh</div>
+      <div class="stat-value" id="stat-time" style="font-size:16px;margin-top:8px;">–</div>
+    </div>
+  </div>
+
+  <!-- Add Rule -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Add Port Forward Rule</span>
+    </div>
+    <div class="card-body">
+      <div class="form-grid">
+        <div class="form-group" style="min-width:200px">
+          <label>VPN User</label>
+          <select id="f-user">
+            <option value="">Loading users…</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Protocol</label>
+          <select id="f-proto">
+            <option value="tcp">TCP</option>
+            <option value="udp">UDP</option>
+            <option value="both">TCP + UDP</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>External Port ↓</label>
+          <input type="number" id="f-ext" min="1" max="65535" placeholder="e.g. 8443">
+        </div>
+        <div class="form-group">
+          <label>Internal Port ↑ (on client)</label>
+          <input type="number" id="f-int" min="1" max="65535" placeholder="e.g. 443">
+        </div>
+        <div class="form-group" style="min-width:180px">
+          <label>Comment (optional)</label>
+          <input type="text" id="f-comment" placeholder="e.g. Alice's web server" maxlength="120">
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" onclick="addRule()">+ Add Rule</button>
+        </div>
+      </div>
+      <div class="alert alert-error" id="form-error"></div>
+      <div class="alert alert-success" id="form-ok"></div>
+    </div>
+  </div>
+
+  <!-- Rules table -->
+  <div class="card">
+    <div class="card-header">
+      <span class="card-title">Port Forward Rules</span>
+      <button class="btn btn-secondary btn-sm" onclick="loadAll()">↻ Refresh</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>User</th>
+            <th>Org</th>
+            <th>Proto</th>
+            <th>External Port</th>
+            <th></th>
+            <th>Internal Port</th>
+            <th>Virtual IP</th>
+            <th>Status</th>
+            <th>Comment</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="rules-body">
+          <tr class="empty-row"><td colspan="10">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</main>
+
+<!-- Change Password Modal -->
+<div class="modal-overlay" id="password-modal">
+  <div class="modal">
+    <h3>Change Admin Password</h3>
+    <div class="form-group">
+      <label>Current Password</label>
+      <input type="password" id="pw-current" autocomplete="current-password">
+    </div>
+    <div class="form-group">
+      <label>New Password</label>
+      <input type="password" id="pw-new" autocomplete="new-password">
+    </div>
+    <div class="form-group">
+      <label>Confirm New Password</label>
+      <input type="password" id="pw-new2" autocomplete="new-password">
+    </div>
+    <div class="alert alert-error" id="pw-error"></div>
+    <div class="alert alert-success" id="pw-ok"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closePasswordModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="changePassword()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let usersMap = {}; // id → {name, org}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function showAlert(id, msg, show = true) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.classList.toggle("show", show);
+}
+function hideAlert(id) { showAlert(id, "", false); }
+
+function protoBadge(proto) {
+  const map = { tcp: "badge-blue", udp: "badge-purple", both: "badge-yellow" };
+  return `<span class="badge ${map[proto] || ''}">${proto.toUpperCase()}</span>`;
+}
+
+function statusBadge(active, vip) {
+  if (active) {
+    return `<span class="badge badge-green">● Active</span>`;
+  }
+  return `<span class="badge badge-red">○ Offline</span>`;
+}
+
+// ── Load data ──────────────────────────────────────────────────────────────
+async function loadUsers() {
+  const res = await fetch("/api/users");
+  const users = await res.json();
+  usersMap = {};
+  users.forEach(u => { usersMap[u.id] = u; });
+  const sel = document.getElementById("f-user");
+  if (users.length === 0) {
+    sel.innerHTML = '<option value="">No users found in Pritunl</option>';
+    return;
+  }
+  sel.innerHTML = users.map(u =>
+    `<option value="${u.id}" data-name="${u.name}" data-org="${u.org}">
+      ${u.name}${u.org ? " (" + u.org + ")" : ""}
+    </option>`
+  ).join("");
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch("/api/status");
+    const s = await res.json();
+    document.getElementById("stat-total").textContent   = s.rules_total;
+    document.getElementById("stat-active").textContent  = s.rules_active;
+    document.getElementById("stat-clients").textContent = s.clients_online;
+    document.getElementById("stat-time").textContent    = new Date().toLocaleTimeString();
+
+    const dot   = document.getElementById("mongo-dot");
+    const label = document.getElementById("mongo-label");
+    dot.className   = "status-dot " + (s.mongodb ? "ok" : "err");
+    label.textContent = s.mongodb ? "MongoDB OK" : "MongoDB Error";
+  } catch(e) {
+    document.getElementById("mongo-dot").className = "status-dot err";
+  }
+}
+
+async function loadRules() {
+  const res = await fetch("/api/rules");
+  const rules = await res.json();
+  const tbody = document.getElementById("rules-body");
+  if (!rules.length) {
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="10">No rules defined. Add one above.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rules.map(r => {
+    const user = usersMap[r.user_id] || { name: r.user_name || r.user_id, org: "" };
+    return `<tr data-id="${r.id}">
+      <td><span style="font-weight:500">${esc(user.name)}</span></td>
+      <td style="color:var(--muted);font-size:12px">${esc(user.org)}</td>
+      <td>${protoBadge(r.proto)}</td>
+      <td><span class="mono">${r.external_port}</span></td>
+      <td style="color:var(--muted)">→</td>
+      <td><span class="mono">${r.internal_port}</span></td>
+      <td><span class="mono" style="color:var(--muted);font-size:12px">${r.virtual_ip || '—'}</span></td>
+      <td>${statusBadge(r.active, r.virtual_ip)}</td>
+      <td style="color:var(--muted);font-size:12px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+          title="${esc(r.comment)}">${esc(r.comment || '')}</td>
+      <td>
+        <button class="btn btn-danger" onclick="deleteRule('${r.id}', '${esc(user.name)}')"
+                title="Delete rule">✕</button>
+      </td>
+    </tr>`;
+  }).join("");
+}
+
+function esc(str) {
+  return String(str || "")
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+async function loadAll() {
+  await Promise.all([loadStatus(), loadRules()]);
+}
+
+// ── Add rule ───────────────────────────────────────────────────────────────
+async function addRule() {
+  hideAlert("form-error");
+  hideAlert("form-ok");
+
+  const sel = document.getElementById("f-user");
+  const userId = sel.value;
+  const userName = sel.options[sel.selectedIndex]?.dataset?.name || "";
+  const proto = document.getElementById("f-proto").value;
+  const extPort = document.getElementById("f-ext").value;
+  const intPort = document.getElementById("f-int").value;
+  const comment = document.getElementById("f-comment").value;
+
+  if (!userId) { showAlert("form-error", "Please select a user."); return; }
+  if (!extPort) { showAlert("form-error", "External port is required."); return; }
+  if (!intPort) { showAlert("form-error", "Internal port is required."); return; }
+
+  const res = await fetch("/api/rules", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ user_id: userId, user_name: userName, proto, external_port: extPort, internal_port: intPort, comment })
+  });
+  const data = await res.json();
+  if (res.ok) {
+    document.getElementById("f-ext").value = "";
+    document.getElementById("f-int").value = "";
+    document.getElementById("f-comment").value = "";
+    showAlert("form-ok", `Rule added: ${proto.toUpperCase()} :${extPort} → ${userName}:${intPort}`);
+    setTimeout(() => hideAlert("form-ok"), 4000);
+    loadAll();
+  } else {
+    showAlert("form-error", data.error || "Failed to add rule.");
+  }
+}
+
+// ── Delete rule ────────────────────────────────────────────────────────────
+async function deleteRule(id, userName) {
+  if (!confirm(`Remove port forward rule for ${userName}?`)) return;
+  const res = await fetch(`/api/rules/${id}`, { method: "DELETE" });
+  if (res.ok) loadAll();
+  else alert("Failed to delete rule.");
+}
+
+// ── Password modal ─────────────────────────────────────────────────────────
+function openPasswordModal() {
+  document.getElementById("pw-current").value = "";
+  document.getElementById("pw-new").value     = "";
+  document.getElementById("pw-new2").value    = "";
+  hideAlert("pw-error");
+  hideAlert("pw-ok");
+  document.getElementById("password-modal").classList.add("show");
+}
+function closePasswordModal() {
+  document.getElementById("password-modal").classList.remove("show");
+}
+
+async function changePassword() {
+  hideAlert("pw-error");
+  hideAlert("pw-ok");
+  const current = document.getElementById("pw-current").value;
+  const newPw   = document.getElementById("pw-new").value;
+  const newPw2  = document.getElementById("pw-new2").value;
+  if (newPw !== newPw2) { showAlert("pw-error", "New passwords do not match."); return; }
+  if (newPw.length < 8)  { showAlert("pw-error", "Password must be at least 8 characters."); return; }
+
+  const res = await fetch("/api/change-password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current, new: newPw })
+  });
+  const data = await res.json();
+  if (res.ok) {
+    showAlert("pw-ok", "Password changed successfully.");
+    setTimeout(closePasswordModal, 2000);
+  } else {
+    showAlert("pw-error", data.error || "Failed to change password.");
+  }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") closePasswordModal();
+});
+
+loadUsers();
+loadAll();
+setInterval(loadAll, 15000);
+</script>
+</body>
+</html>
