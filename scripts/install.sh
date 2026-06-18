@@ -68,14 +68,15 @@ chmod 750 "$CONFIG_DIR"
 
 # ── Copy files ─────────────────────────────────────────────
 log "Installing application files to $INSTALL_DIR…"
+# install.sh lives in <repo>/scripts/, app.py/daemon.py/templates live in <repo>/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 
-if [[ ! -f "$REPO_ROOT/app.py" ]]; then
-  err "Could not find app.py at $REPO_ROOT — run this script from inside the cloned repo (e.g. 'sudo bash scripts/install.sh')"
+if [[ ! -f "$REPO_ROOT/app.py" ]] || [[ ! -f "$REPO_ROOT/common.py" ]]; then
+  err "Could not find app.py/common.py at $REPO_ROOT — run this script from inside the cloned repo (e.g. 'sudo bash scripts/install.sh')"
 fi
 
-cp -r "$REPO_ROOT"/app.py "$REPO_ROOT"/daemon.py "$REPO_ROOT"/templates "$INSTALL_DIR"/
+cp -r "$REPO_ROOT"/app.py "$REPO_ROOT"/daemon.py "$REPO_ROOT"/common.py "$REPO_ROOT"/templates "$INSTALL_DIR"/
 
 # ── Python venv ────────────────────────────────────────────
 log "Creating Python virtual environment…"
@@ -164,12 +165,17 @@ if [[ ! -f "$CONFIG_DIR/env" ]]; then
 # Edit as needed, then restart both services.
 
 RULES_FILE=$CONFIG_DIR/rules.json
+STATUS_FILE=$CONFIG_DIR/status.json
 CONFIG_FILE=$CONFIG_DIR/config.json
 MONGO_URI=mongodb://localhost:27017/
 MONGO_DB=pritunl
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=8181
 POLL_SECS=10
+# How often (in poll cycles) to refresh StrongSwan/IPsec tunnel status.
+# Each swanctl/ipsec call spawns a subprocess, so this is checked less
+# often than the main sync loop. Only relevant if you use IPsec-type rules.
+IPSEC_POLL_EVERY=3
 EOF
   chown root:root "$CONFIG_DIR/env"
   chmod 640 "$CONFIG_DIR/env"
