@@ -324,60 +324,66 @@ def _find_outbound_duplicate(rules, etype, user_id, target_ip, destination_ip, p
     return None
 
 
-@app.route("/api/rules", methods=["POST"])
-@login_required
-def api_add_rule():
-    data = request.json or {}
+def _validate_rule_payload(data, etype, direction, other_rules):
+    """
+    Validates and normalizes the editable fields for a rule — shared by
+    both rule creation (POST) and rule editing (PATCH), so an edit can't
+    silently bypass the same conflict/overlap/format checks a new rule
+    goes through. `other_rules` should be every OTHER rule already in
+    rules.json (the full list for a create; the list with the rule being
+    edited excluded, for an update) — overlap/duplicate checks run
+    against this set.
+
+    Returns (fields_dict, None, None) on success, or
+    (None, error_message, status_code) on failure. status_code is 409
+    for a genuine conflict/overlap with something else, 400 for a plain
+    invalid-input problem.
+    """
     errors = []
-
-    etype = str(data.get("endpoint_type", "pritunl")).strip()
-    if etype not in VALID_ENDPOINT_TYPES:
-        errors.append("endpoint_type must be one of: pritunl, static, ipsec")
-
-    direction = str(data.get("direction", "inbound")).strip()
-    if direction not in VALID_DIRECTIONS:
-        errors.append("direction must be 'inbound' or 'outbound'")
 
     proto = str(data.get("proto", "")).lower().strip()
     if proto not in VALID_PROTOS:
         errors.append("proto must be tcp, udp, or both")
 
     comment = str(data.get("comment", "")).strip()[:120]
-
-    user_id = user_name = target_ip = tunnel_name = label = None
+    fields = {"proto": proto, "comment": comment}
 
     if etype == "pritunl":
         user_id = str(data.get("user_id", "")).strip()
-        user_name = str(data.get("user_name", "")).strip()
         if not user_id:
             errors.append("user_id is required for endpoint_type 'pritunl'")
-
+        fields["user_id"] = user_id
+        fields["user_name"] = str(data.get("user_name", "")).strip()
     elif etype == "static":
         target_ip = str(data.get("target_ip", "")).strip()
-        label = str(data.get("label", "")).strip()[:60]
         if not valid_ip(target_ip):
             errors.append("a valid target_ip is required for endpoint_type 'static'")
-
+        fields["target_ip"] = target_ip
+        fields["label"] = str(data.get("label", "")).strip()[:60]
     elif etype == "ipsec":
         target_ip = str(data.get("target_ip", "")).strip()
         tunnel_name = str(data.get("tunnel_name", "")).strip()
-        label = str(data.get("label", "")).strip()[:60]
         if not valid_ip(target_ip):
             errors.append("a valid target_ip is required for endpoint_type 'ipsec'")
         if not tunnel_name:
             errors.append("tunnel_name is required for endpoint_type 'ipsec'")
+        fields["target_ip"] = target_ip
+        fields["tunnel_name"] = tunnel_name
+        fields["label"] = str(data.get("label", "")).strip()[:60]
 
-    rules = load_rules()
-    protos_to_check = ["tcp", "udp"] if proto == "both" else [proto] if proto in VALID_PROTOS else []
+    if errors:
+        return None, "; ".join(errors), 400
+
+    protos_to_check = ["tcp", "udp"] if proto == "both" else [proto]
 
     if direction == "inbound":
         ext_spec, int_spec = _validate_inbound_ports(data, errors)
         if errors:
-            return jsonify(error="; ".join(errors)), 400
+            return None, "; ".join(errors), 400
 
         ext_low, ext_high = parse_port_spec(ext_spec)
 
-        for r in rules:
+        for r in other_rules:
             if r.get("direction", "inbound") != "inbound":
                 continue
             try:
@@ -386,27 +392,19 @@ def api_add_rule():
                 continue
             r_protos = ["tcp", "udp"] if r["proto"] == "both" else [r["proto"]]
             if set(protos_to_check) & set(r_protos) and ranges_overlap(ext_low, ext_high, r_low, r_high):
-                return jsonify(error=f"External port(s) {ext_spec}/{proto} overlap "
-                                      f"with an existing rule ({r['external_port']})"), 409
+                return None, (f"External port(s) {ext_spec}/{proto} overlap "
+                               f"with an existing rule ({r['external_port']})"), 409
 
         local_ports = get_local_listening_ports()
         for p in protos_to_check:
             local_set = local_ports.get(p, set())
             if any(port in local_set for port in range(ext_low, ext_high + 1)):
-                return jsonify(error=f"Port(s) {ext_spec}/{p} are already in use by a "
-                                      f"local service on this host — choose a "
-                                      f"different external port"), 409
+                return None, (f"Port(s) {ext_spec}/{p} are already in use by a "
+                               f"local service on this host — choose a "
+                               f"different external port"), 409
 
-        new_rule = {
-            "id": gen_rule_id(),
-            "endpoint_type": etype,
-            "direction": direction,
-            "proto": proto,
-            "external_port": ext_spec,
-            "internal_port": int_spec,
-            "comment": comment,
-            "created_at": datetime.utcnow().isoformat(),
-        }
+        fields["external_port"] = ext_spec
+        fields["internal_port"] = int_spec
 
     else:  # outbound
         source_port_raw = data.get("source_port")
@@ -416,41 +414,51 @@ def api_add_rule():
         if destination_ip and not valid_ip(destination_ip):
             errors.append("destination_ip must be a valid IP if provided")
         if errors:
-            return jsonify(error="; ".join(errors)), 400
+            return None, "; ".join(errors), 400
 
         src_low, src_high = parse_port_spec(source_port_raw)
-        dup = _find_outbound_duplicate(rules, etype, user_id, target_ip, destination_ip,
-                                        protos_to_check, src_low, src_high)
+        dup = _find_outbound_duplicate(other_rules, etype, fields.get("user_id"), fields.get("target_ip"),
+                                        destination_ip, protos_to_check, src_low, src_high)
         if dup:
-            return jsonify(error=f"This overlaps with an existing outbound rule "
-                                  f"(source port {dup.get('source_port')}, "
-                                  f"destination {dup.get('destination_ip') or 'any'})"), 409
+            return None, (f"This overlaps with an existing outbound rule "
+                           f"(source port {dup.get('source_port')}, "
+                           f"destination {dup.get('destination_ip') or 'any'})"), 409
 
-        new_rule = {
-            "id": gen_rule_id(),
-            "endpoint_type": etype,
-            "direction": direction,
-            "proto": proto,
-            "source_port": str(source_port_raw).strip(),
-            "destination_ip": destination_ip,
-            "comment": comment,
-            "created_at": datetime.utcnow().isoformat(),
-        }
+        fields["source_port"] = str(source_port_raw).strip()
+        fields["destination_ip"] = destination_ip
 
-    if etype == "pritunl":
-        new_rule["user_id"] = user_id
-        new_rule["user_name"] = user_name
-    elif etype == "static":
-        new_rule["target_ip"] = target_ip
-        new_rule["label"] = label
-    elif etype == "ipsec":
-        new_rule["target_ip"] = target_ip
-        new_rule["tunnel_name"] = tunnel_name
-        new_rule["label"] = label
+    return fields, None, None
 
+
+@app.route("/api/rules", methods=["POST"])
+@login_required
+def api_add_rule():
+    data = request.json or {}
+
+    etype = str(data.get("endpoint_type", "pritunl")).strip()
+    if etype not in VALID_ENDPOINT_TYPES:
+        return jsonify(error="endpoint_type must be one of: pritunl, static, ipsec"), 400
+
+    direction = str(data.get("direction", "inbound")).strip()
+    if direction not in VALID_DIRECTIONS:
+        return jsonify(error="direction must be 'inbound' or 'outbound'"), 400
+
+    rules = load_rules()
+    fields, error, status = _validate_rule_payload(data, etype, direction, rules)
+    if error:
+        return jsonify(error=error), status
+
+    new_rule = {
+        "id": gen_rule_id(),
+        "endpoint_type": etype,
+        "direction": direction,
+        "created_at": datetime.utcnow().isoformat(),
+        **fields,
+    }
     rules.append(new_rule)
     save_rules(rules)
-    log.info(f"Rule added ({etype}, {direction}): {proto} {new_rule.get('external_port') or new_rule.get('source_port')}")
+    log.info(f"Rule added ({etype}, {direction}): {new_rule['proto']} "
+             f"{new_rule.get('external_port') or new_rule.get('source_port')}")
     return jsonify(new_rule), 201
 
 
@@ -463,17 +471,25 @@ def api_update_rule(rule_id):
     if not target:
         return jsonify(error="Rule not found"), 404
 
-    # Editing is intentionally limited to cosmetic/port fields. To change
-    # endpoint_type itself, delete and recreate the rule - this keeps
-    # validation logic in one place (api_add_rule) instead of duplicated.
-    allowed_fields = {
-        "proto", "external_port", "internal_port", "comment", "direction",
-        "user_id", "user_name", "target_ip", "tunnel_name", "label",
-        "source_port", "destination_ip",
-    }
-    for k, v in data.items():
-        if k in allowed_fields:
-            target[k] = v
+    # endpoint_type and direction are intentionally fixed for the life of
+    # a rule — changing either changes which fields even apply (a totally
+    # different field set), so delete-and-recreate is the supported way
+    # to do that. Everything else (ports, proto, comment, and the
+    # endpoint's own identity fields) goes through the exact same
+    # validation a new rule would, just with this rule excluded from the
+    # overlap/conflict checks so it doesn't flag itself.
+    etype = target["endpoint_type"]
+    direction = target.get("direction", "inbound")
+
+    merged = dict(target)
+    merged.update(data)
+    other_rules = [r for r in rules if r["id"] != rule_id]
+
+    fields, error, status = _validate_rule_payload(merged, etype, direction, other_rules)
+    if error:
+        return jsonify(error=error), status
+
+    target.update(fields)
     target["updated_at"] = datetime.utcnow().isoformat()
     save_rules(rules)
     log.info(f"Rule updated: {rule_id}")
@@ -491,6 +507,108 @@ def api_delete_rule(rule_id):
     save_rules(rules)
     log.info(f"Rule deleted: {rule_id}")
     return jsonify(ok=True)
+
+
+SNAPSHOT_FORMAT = "pritunl-portfwd-rules-snapshot"
+SNAPSHOT_SCHEMA_VERSION = 1
+
+
+@app.route("/api/rules/export")
+@login_required
+def api_export_rules():
+    """
+    Downloadable backup of every current rule definition, wrapped with
+    enough metadata to be recognized and safely re-validated on import.
+    This is a config snapshot only - it doesn't capture *live* state
+    (which Pritunl user happens to be connected right now, current tunnel
+    health, etc.), since that's inherently a moving target; re-importing
+    it re-creates the same rule definitions, which the daemon then applies
+    according to whatever's actually live at restore time.
+    """
+    rules = load_rules()
+    snapshot = {
+        "format": SNAPSHOT_FORMAT,
+        "schema_version": SNAPSHOT_SCHEMA_VERSION,
+        "exported_at": datetime.utcnow().isoformat(),
+        "rule_count": len(rules),
+        "rules": rules,
+    }
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    resp = jsonify(snapshot)
+    resp.headers["Content-Disposition"] = f'attachment; filename="pritunl-portfwd-rules-{ts}.json"'
+    return resp
+
+
+@app.route("/api/rules/restore", methods=["POST"])
+@login_required
+def api_restore_rules():
+    """
+    Restores rules from a previously exported snapshot. Every rule in the
+    file is re-validated exactly as if it were being added by hand (port
+    format, range compatibility, conflict/overlap checks) - anything that
+    doesn't pass is skipped and reported, rather than blocking the whole
+    restore or being silently applied unchecked. Rule IDs are always
+    regenerated, so re-importing the same file twice (or importing it on
+    a different host) never collides with anything by coincidence.
+
+    mode "merge"   - keep existing rules, add the snapshot's rules to them
+    mode "replace" - wipe existing rules first (the web UI confirms this
+                      with the admin before sending the request)
+    """
+    body = request.json or {}
+    mode = str(body.get("mode", "merge")).strip()
+    if mode not in ("merge", "replace"):
+        return jsonify(error="mode must be 'merge' or 'replace'"), 400
+
+    snapshot = body.get("snapshot")
+    if not isinstance(snapshot, dict) or snapshot.get("format") != SNAPSHOT_FORMAT:
+        return jsonify(error="This doesn't look like a pritunl-portfwd rules export file"), 400
+
+    incoming = snapshot.get("rules")
+    if not isinstance(incoming, list):
+        return jsonify(error="Snapshot file has no rules list"), 400
+
+    existing = [] if mode == "replace" else load_rules()
+    applied = []
+    skipped = []
+
+    for raw in incoming:
+        if not isinstance(raw, dict):
+            skipped.append({"rule": str(raw)[:80], "reason": "not a valid rule object"})
+            continue
+
+        etype = str(raw.get("endpoint_type", "")).strip()
+        direction = str(raw.get("direction", "inbound")).strip()
+        port_hint = raw.get("external_port") or raw.get("source_port") or "?"
+        summary = f"{etype or '?'}/{direction} :{port_hint}"
+
+        if etype not in VALID_ENDPOINT_TYPES:
+            skipped.append({"rule": summary, "reason": "invalid or missing endpoint_type"})
+            continue
+        if direction not in VALID_DIRECTIONS:
+            skipped.append({"rule": summary, "reason": "invalid direction"})
+            continue
+
+        # Validate against both the untouched pre-existing rules (merge
+        # mode only) and whatever's already been accepted from this same
+        # snapshot, so duplicates *within* the file are caught too.
+        fields, error, _status = _validate_rule_payload(raw, etype, direction, existing + applied)
+        if error:
+            skipped.append({"rule": summary, "reason": error})
+            continue
+
+        applied.append({
+            "id": gen_rule_id(),
+            "endpoint_type": etype,
+            "direction": direction,
+            "created_at": datetime.utcnow().isoformat(),
+            **fields,
+        })
+
+    save_rules(existing + applied)
+    log.info(f"Rules restored ({mode}): {len(applied)} applied, {len(skipped)} skipped, "
+             f"{len(incoming)} total in snapshot")
+    return jsonify(applied=len(applied), skipped=skipped, total=len(incoming))
 
 
 @app.route("/api/users")

@@ -13,6 +13,7 @@ Beyond basic forwarding:
 - **Outbound rules** that pin the source port of an endpoint's outgoing connections via SNAT — for remote services that expect traffic from one fixed, predictable port
 - **Import** of pre-existing iptables port-forward rules already on the host, so they become fully managed by this tool
 - **Live traffic inspection** — peek at a rule's traffic with `tcpdump`, filterable by IP/port/protocol, running only while you have it open
+- **Backup and restore** — export every rule definition to a JSON file, and re-import it later (merge or full replace) with the same validation a hand-added rule goes through
 
 Before any rule is applied, it's checked against ports already in use locally and against pre-existing iptables rules, so it won't silently steal traffic from another service.
 
@@ -246,6 +247,12 @@ The deeper check can only run in the daemon because reading `iptables` requires 
 
 **Outbound rules** get a simpler, config-level check instead: when you add one, the UI checks whether another existing outbound rule already pins the *same* source endpoint to an overlapping source port for an overlapping destination scope, and rejects the new rule with a `409` if so. This doesn't need root/iptables access, since outbound rules are always inserted at the top of the chain — there's no "shadowed by an earlier rule" scenario to detect the way there is for inbound rules.
 
+**Resolving a conflict:** there's no "force apply anyway" option — that's intentional, the whole point is to never silently hijack traffic. Depending on the reason shown:
+- *Local service already listening* → stop/reconfigure that service, or edit the rule (✏️) to use a free port instead
+- *Existing non-portfwd iptables rule* → either import it via the [Discovered Existing iptables Rules](#importing-existing-iptables-rules) panel if you want to keep and manage what it does, or remove it yourself (`sudo iptables -t nat -D ...`) if it's stale, or edit your rule to a non-overlapping port
+
+Once the underlying conflict clears, the daemon picks the rule back up automatically on its next sync — no restart needed.
+
 ### Rule status badges
 
 | Badge | Meaning |
@@ -258,9 +265,26 @@ The deeper check can only run in the daemon because reading `iptables` requires 
 | ? Tunnel Unknown | IPsec rule; daemon couldn't determine tunnel state (see StrongSwan caveats) |
 | ⚠ Conflict | Rule skipped — collides with a port already in use or an existing non-portfwd iptables rule |
 
+### Editing a rule
+
+Click **✏️** on any rule to change its protocol, ports (or source port / destination IP, for an outbound rule), or comment — the same validation a new rule goes through (port format, range compatibility, conflict/overlap checks) runs on save, just excluding the rule itself from the overlap checks so it doesn't flag against its own current values.
+
+`endpoint_type` and `direction` are intentionally **not** editable — changing either means a completely different field set applies (e.g. ports vs. source-port-and-destination), so delete and recreate the rule for that case instead. The endpoint identity itself (which VPN user / which static IP / which tunnel) is shown read-only in the edit dialog for the same reason.
+
 ### Deleting a rule
 
 Click the **✕** button on any rule row. The iptables rule is removed within ~10 seconds.
+
+### Backup and restore
+
+Click **⬇ Export** in the header to download every current rule definition as a single JSON file (`pritunl-portfwd-rules-<timestamp>.json`) — a config-only snapshot, not a capture of live state (which Pritunl user happens to be connected right now, current tunnel health, etc. is inherently a moving target). Keep it somewhere off the host as an actual backup, check it into your own private config-management repo, or use it to set up a second/replacement server with the same rules.
+
+To bring a snapshot back, click **⬆ Import**, choose the file, and pick a mode:
+
+- **Merge** — adds the snapshot's rules to whatever's already configured, skipping anything that conflicts with an existing rule
+- **Replace** — deletes all current rules first, then applies the snapshot from a clean slate (the UI asks for confirmation before doing this, since it's destructive)
+
+Every rule in the file goes through the exact same validation a manually-added rule would — port format, range compatibility, conflict/overlap checks — so a corrupted or hand-edited file can't silently produce a broken or conflicting rule set. Anything that doesn't pass is **skipped and listed with a reason** rather than blocking the rest of the restore, so one bad entry doesn't prevent the rest of a snapshot from coming back. Rule IDs are always regenerated on import (never reused from the file), so importing the same snapshot twice — or onto a different host entirely — never collides with anything by coincidence.
 
 ### Protocol options explained
 
@@ -548,6 +572,12 @@ Resolve the underlying conflict (free the port, or remove/adjust the other rule)
 ### "Inspect" modal opens but shows no traffic
 - Confirm the rule actually has an active target (an offline VPN user, for instance, has no `target_ip` to capture against — the modal will say so).
 - If you added an IP/port/protocol filter, double check it isn't excluding the traffic you're expecting to see — clear the filters and click **Apply Filter** to capture broadly first.
+
+### Import (restore) says "This doesn't look like a pritunl-portfwd rules export file"
+The uploaded file is either not a valid JSON export from this tool's **⬇ Export** button, or it's been hand-edited and lost its `format` field. Re-export a fresh snapshot, or add `"format": "pritunl-portfwd-rules-snapshot"` back to the file if you're confident the rest of its structure is intact.
+
+### Import (restore) skipped some rules
+This is expected if those specific rules don't pass the normal validation a hand-added rule would — check the listed reason for each (most commonly: a port conflicts with something that wasn't conflicting when the snapshot was taken, or the file was edited by hand and a port field is malformed). Fix the underlying issue and re-run the import, or add that one rule manually instead.
 
 ### IPsec tunnel always shows "? Tunnel Unknown"
 This means the daemon's `swanctl`/`ipsec` parser didn't match your StrongSwan output format — see [IPsec / StrongSwan Integration](#ipsec--strongswan-integration) above for how to diagnose and adjust it. The forwarding rule itself still works regardless of this status display.

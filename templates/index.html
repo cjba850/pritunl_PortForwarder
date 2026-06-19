@@ -329,6 +329,8 @@
       <span class="status-dot" id="mongo-dot"></span>
       <span id="mongo-label">MongoDB</span>
     </div>
+    <button class="btn btn-secondary btn-sm" onclick="exportRules()" title="Download a JSON snapshot of all current rules">⬇ Export</button>
+    <button class="btn btn-secondary btn-sm" onclick="openImportModal()" title="Restore rules from a previously exported snapshot">⬆ Import</button>
     <button class="btn btn-secondary btn-sm" onclick="openPasswordModal()">⚙ Password</button>
     <a class="nav-link" href="/logout">Logout</a>
   </div>
@@ -549,6 +551,93 @@
   </div>
 </div>
 
+<!-- Import / Restore Rules Modal -->
+<div class="modal-overlay" id="import-modal">
+  <div class="modal modal-wide">
+    <h3>Import / Restore Rules</h3>
+
+    <div class="form-group">
+      <label>Snapshot file</label>
+      <input type="file" id="import-file-input" accept="application/json,.json">
+    </div>
+    <div class="form-group">
+      <label>Mode</label>
+      <select id="import-mode">
+        <option value="merge">Merge — add to existing rules, skip anything that conflicts</option>
+        <option value="replace">Replace — delete existing rules first</option>
+      </select>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:10px">
+      Every rule in the file is re-validated on import (port format, range compatibility, conflicts) exactly as
+      if you'd added it by hand — anything that doesn't pass is skipped and listed below rather than blocking
+      the rest of the restore. Rule IDs are always regenerated, so re-importing the same file twice is safe.
+    </div>
+
+    <div class="alert alert-error" id="import-error"></div>
+    <div id="import-results" style="display:none;font-size:12px;margin-top:6px"></div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeImportModal()">Close</button>
+      <button class="btn btn-primary" onclick="runImport()">Restore</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Rule Modal -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <h3 id="edit-title">Edit Rule</h3>
+
+    <div class="form-group">
+      <label>Endpoint</label>
+      <div id="edit-endpoint-readout" style="font-size:13px;color:var(--muted);line-height:1.6"></div>
+    </div>
+
+    <div class="form-group">
+      <label>Protocol</label>
+      <select id="edit-proto">
+        <option value="tcp">TCP</option>
+        <option value="udp">UDP</option>
+        <option value="both">TCP + UDP</option>
+      </select>
+    </div>
+
+    <div id="edit-fields-inbound">
+      <div class="form-group">
+        <label>External Port(s) ↓</label>
+        <input type="text" id="edit-ext" placeholder="e.g. 8443 or 8000-8010">
+      </div>
+      <div class="form-group">
+        <label>Internal Port(s) ↑</label>
+        <input type="text" id="edit-int" placeholder="e.g. 443 or 8000-8010">
+      </div>
+    </div>
+
+    <div id="edit-fields-outbound" style="display:none">
+      <div class="form-group">
+        <label>Source Port(s) to pin</label>
+        <input type="text" id="edit-source-port" placeholder="e.g. 5001">
+      </div>
+      <div class="form-group">
+        <label>Destination IP (optional)</label>
+        <input type="text" id="edit-dest-ip" placeholder="blank = any destination">
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Comment</label>
+      <input type="text" id="edit-comment" maxlength="120">
+    </div>
+
+    <div class="alert alert-error" id="edit-error"></div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeEditModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEditedRule()">Save</button>
+    </div>
+  </div>
+</div>
+
 <!-- Inspect (tcpdump) Modal -->
 <div class="modal-overlay" id="inspect-modal">
   <div class="modal modal-wide">
@@ -765,6 +854,7 @@ async function loadRules() {
       <td style="color:var(--muted);font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
           title="${esc(r.comment)}">${esc(r.comment || '')}</td>
       <td style="white-space:nowrap">
+        <button class="btn btn-secondary btn-sm" onclick="openEditModal('${r.id}')" title="Edit ports/proto/comment">✏️</button>
         <button class="btn btn-secondary btn-sm" onclick="openInspectModal('${r.id}')" title="Peek at live traffic for this rule">👁</button>
         <button class="btn btn-danger" onclick="deleteRule('${r.id}', '${esc(displayName(r))}')"
                 title="Delete rule">✕</button>
@@ -862,6 +952,164 @@ async function deleteRule(id, name) {
   const res = await fetch(`/api/rules/${id}`, { method: "DELETE" });
   if (res.ok) loadAll();
   else alert("Failed to delete rule.");
+}
+
+// ── Export / Import (backup & restore) ──────────────────────────────────────
+async function exportRules() {
+  try {
+    const res = await fetch("/api/rules/export");
+    if (!res.ok) { alert("Failed to export rules."); return; }
+    const blob = await res.blob();
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `pritunl-portfwd-rules-${ts}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {
+    alert("Failed to export rules.");
+  }
+}
+
+function openImportModal() {
+  document.getElementById("import-file-input").value = "";
+  document.getElementById("import-mode").value = "merge";
+  hideAlert("import-error");
+  const results = document.getElementById("import-results");
+  results.style.display = "none";
+  results.innerHTML = "";
+  document.getElementById("import-modal").classList.add("show");
+}
+
+function closeImportModal() {
+  document.getElementById("import-modal").classList.remove("show");
+}
+
+async function runImport() {
+  hideAlert("import-error");
+  const fileInput = document.getElementById("import-file-input");
+  const mode = document.getElementById("import-mode").value;
+
+  if (!fileInput.files.length) {
+    showAlert("import-error", "Choose a snapshot file first.");
+    return;
+  }
+  if (mode === "replace" &&
+      !confirm("This will delete ALL current rules and replace them with the file's contents. This cannot be undone. Continue?")) {
+    return;
+  }
+
+  let snapshot;
+  try {
+    snapshot = JSON.parse(await fileInput.files[0].text());
+  } catch (e) {
+    showAlert("import-error", "That file isn't valid JSON.");
+    return;
+  }
+
+  const res = await fetch("/api/rules/restore", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode, snapshot })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    showAlert("import-error", data.error || "Restore failed.");
+    return;
+  }
+
+  const results = document.getElementById("import-results");
+  results.style.display = "";
+  let html = `<div style="color:var(--green);margin-bottom:6px">✓ ${data.applied} of ${data.total} rule(s) applied.</div>`;
+  if (data.skipped && data.skipped.length) {
+    html += `<div style="color:var(--warn);margin-bottom:4px">${data.skipped.length} skipped:</div>
+      <ul style="margin:0 0 0 18px;color:var(--muted)">` +
+      data.skipped.map(s => `<li><span class="mono">${esc(s.rule)}</span> — ${esc(s.reason)}</li>`).join("") +
+      `</ul>`;
+  }
+  results.innerHTML = html;
+  loadAll();
+}
+
+// ── Edit rule modal ──────────────────────────────────────────────────────
+function openEditModal(ruleId) {
+  const r = rulesCache.find(x => x.id === ruleId);
+  if (!r) return;
+
+  document.getElementById("edit-modal").dataset.ruleId = ruleId;
+  document.getElementById("edit-title").textContent = `Edit Rule: ${displayName(r)}`;
+
+  let readout = endpointTypeBadge(r.endpoint_type) + " ";
+  if (r.endpoint_type === "pritunl") {
+    readout += `VPN user <strong>${esc(displayName(r))}</strong> — fixed; delete &amp; recreate to reassign`;
+  } else if (r.endpoint_type === "static") {
+    readout += `Target IP <strong>${esc(r.target_ip)}</strong> — fixed`;
+  } else {
+    readout += `Target IP <strong>${esc(r.target_ip)}</strong> via tunnel <strong>${esc(r.tunnel_name)}</strong> — fixed`;
+  }
+  document.getElementById("edit-endpoint-readout").innerHTML = readout;
+
+  document.getElementById("edit-proto").value = r.proto;
+  document.getElementById("edit-comment").value = r.comment || "";
+
+  const isOutbound = r.direction === "outbound";
+  document.getElementById("edit-fields-inbound").style.display = isOutbound ? "none" : "";
+  document.getElementById("edit-fields-outbound").style.display = isOutbound ? "" : "none";
+  if (isOutbound) {
+    document.getElementById("edit-source-port").value = r.source_port || "";
+    document.getElementById("edit-dest-ip").value = r.destination_ip || "";
+  } else {
+    document.getElementById("edit-ext").value = r.external_port || "";
+    document.getElementById("edit-int").value = r.internal_port || "";
+  }
+
+  hideAlert("edit-error");
+  document.getElementById("edit-modal").classList.add("show");
+}
+
+function closeEditModal() {
+  document.getElementById("edit-modal").classList.remove("show");
+}
+
+async function saveEditedRule() {
+  hideAlert("edit-error");
+  const ruleId = document.getElementById("edit-modal").dataset.ruleId;
+  const r = rulesCache.find(x => x.id === ruleId);
+  if (!r) return;
+
+  const payload = {
+    proto: document.getElementById("edit-proto").value,
+    comment: document.getElementById("edit-comment").value,
+  };
+
+  if (r.direction === "outbound") {
+    const srcPort = document.getElementById("edit-source-port").value;
+    if (!srcPort) { showAlert("edit-error", "Source port is required."); return; }
+    payload.source_port = srcPort;
+    payload.destination_ip = document.getElementById("edit-dest-ip").value.trim();
+  } else {
+    const extPort = document.getElementById("edit-ext").value;
+    const intPort = document.getElementById("edit-int").value;
+    if (!extPort) { showAlert("edit-error", "External port is required."); return; }
+    if (!intPort) { showAlert("edit-error", "Internal port is required."); return; }
+    payload.external_port = extPort;
+    payload.internal_port = intPort;
+  }
+
+  const res = await fetch(`/api/rules/${ruleId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json();
+  if (res.ok) {
+    closeEditModal();
+    loadAll();
+  } else {
+    showAlert("edit-error", data.error || "Failed to update rule.");
+  }
 }
 
 // ── Discovered existing iptables rules (import) ────────────────────────────
@@ -1033,7 +1281,15 @@ async function changePassword() {
 document.addEventListener("keydown", e => {
   if (e.key !== "Escape") return;
   closePasswordModal();
+  closeEditModal();
+  closeImportModal();
   if (document.getElementById("inspect-modal").classList.contains("show")) closeInspectModal();
+});
+document.getElementById("edit-modal").addEventListener("click", e => {
+  if (e.target.id === "edit-modal") closeEditModal();
+});
+document.getElementById("import-modal").addEventListener("click", e => {
+  if (e.target.id === "import-modal") closeImportModal();
 });
 document.getElementById("inspect-modal").addEventListener("click", e => {
   if (e.target.id === "inspect-modal") closeInspectModal();
