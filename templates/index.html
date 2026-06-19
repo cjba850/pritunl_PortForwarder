@@ -273,6 +273,32 @@
     .modal h3 { margin-bottom: 16px; font-size: 15px; }
     .modal .form-group { margin-bottom: 14px; }
     .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px; }
+    .modal-wide { width: 640px; }
+    .capture-filters {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .capture-output {
+      background: #010409;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      height: 320px;
+      overflow-y: auto;
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 11.5px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: #9be9a8;
+    }
+    .capture-output .placeholder { color: var(--muted); font-style: italic; }
+    .capture-statusline {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: var(--muted); margin: 10px 0;
+    }
 
     /* ── Topnav links ── */
     .nav-link {
@@ -329,6 +355,10 @@
       <div class="stat-value" id="stat-conflicts" style="color:var(--red)">–</div>
     </div>
     <div class="stat-card">
+      <div class="stat-label">Discovered Rules</div>
+      <div class="stat-value" id="stat-importable" style="color:var(--warn)">–</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">Last Refresh</div>
       <div class="stat-value" id="stat-time" style="font-size:16px;margin-top:8px;">–</div>
     </div>
@@ -382,6 +412,13 @@
         </div>
 
         <div class="form-group">
+          <label>Direction</label>
+          <select id="f-direction" onchange="updateDirectionFields()">
+            <option value="inbound">Inbound</option>
+            <option value="outbound">Outbound (pin source port)</option>
+          </select>
+        </div>
+        <div class="form-group">
           <label>Protocol</label>
           <select id="f-proto">
             <option value="tcp">TCP</option>
@@ -389,14 +426,27 @@
             <option value="both">TCP + UDP</option>
           </select>
         </div>
-        <div class="form-group">
-          <label>External Port ↓</label>
-          <input type="number" id="f-ext" min="1" max="65535" placeholder="e.g. 8443">
+
+        <!-- Inbound fields -->
+        <div class="form-group direction-fields dir-inbound">
+          <label>External Port(s) ↓</label>
+          <input type="text" id="f-ext" placeholder="e.g. 8443 or 8000-8010">
         </div>
-        <div class="form-group">
-          <label>Internal Port ↑</label>
-          <input type="number" id="f-int" min="1" max="65535" placeholder="e.g. 443">
+        <div class="form-group direction-fields dir-inbound">
+          <label>Internal Port(s) ↑</label>
+          <input type="text" id="f-int" placeholder="e.g. 443 or 8000-8010">
         </div>
+
+        <!-- Outbound fields -->
+        <div class="form-group direction-fields dir-outbound" style="display:none">
+          <label>Source Port(s) to pin</label>
+          <input type="text" id="f-source-port" placeholder="e.g. 5001">
+        </div>
+        <div class="form-group direction-fields dir-outbound" style="display:none">
+          <label>Destination IP (optional)</label>
+          <input type="text" id="f-dest-ip" placeholder="blank = any destination">
+        </div>
+
         <div class="form-group" style="min-width:170px">
           <label>Comment (optional)</label>
           <input type="text" id="f-comment" placeholder="optional note" maxlength="120">
@@ -405,8 +455,42 @@
           <button class="btn btn-primary" onclick="addRule()">+ Add Rule</button>
         </div>
       </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:8px">
+        Port ranges (e.g. <span class="mono">8000-8010</span>) are supported on either side of an inbound rule. A range on
+        one side and a single port on the other is valid (many-to-one or one-to-many); two differently-sized ranges are not.<br>
+        <strong>Outbound</strong> rules pin the source port of new outbound connections from this endpoint via SNAT/MASQUERADE
+        (e.g. so a remote service that expects all traffic from one fixed port sees it consistently) — they're inserted ahead
+        of Pritunl's own default MASQUERADE rule so they actually take effect. They can't redirect reply traffic that's already
+        part of an established connection (the kernel reuses cached NAT state for that) — only genuinely new outbound connections.
+      </div>
       <div class="alert alert-error" id="form-error"></div>
       <div class="alert alert-success" id="form-ok"></div>
+    </div>
+  </div>
+
+  <!-- Discovered existing iptables rules -->
+  <div class="card" id="importable-card" style="display:none">
+    <div class="card-header">
+      <span class="card-title">Discovered Existing iptables Rules</span>
+    </div>
+    <div class="card-body">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:10px">
+        These DNAT rules already exist on this host but weren't created by this tool. Importing one removes
+        the original raw rule and re-creates it as a managed rule here, so it becomes editable/deletable like
+        any other — applied within ~10s of clicking Import.
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Proto</th>
+            <th>External Port(s)</th>
+            <th></th>
+            <th>Target</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="importable-body"></tbody>
+      </table>
     </div>
   </div>
 
@@ -465,9 +549,51 @@
   </div>
 </div>
 
+<!-- Inspect (tcpdump) Modal -->
+<div class="modal-overlay" id="inspect-modal">
+  <div class="modal modal-wide">
+    <h3 id="inspect-title">Inspect Traffic</h3>
+
+    <div class="capture-filters">
+      <div class="form-group" style="margin-bottom:0">
+        <label>IP filter</label>
+        <input type="text" id="insp-ip" placeholder="optional">
+      </div>
+      <div class="form-group" style="margin-bottom:0">
+        <label>Port filter</label>
+        <input type="text" id="insp-port" placeholder="optional">
+      </div>
+      <div class="form-group" style="margin-bottom:0">
+        <label>Protocol</label>
+        <select id="insp-proto">
+          <option value="">any</option>
+          <option value="tcp">tcp</option>
+          <option value="udp">udp</option>
+        </select>
+      </div>
+      <div class="form-group" style="margin-bottom:0;align-self:end">
+        <button class="btn btn-secondary" style="width:100%" onclick="restartCapture()">Apply Filter</button>
+      </div>
+    </div>
+
+    <div class="capture-statusline">
+      <span class="status-dot" id="insp-dot"></span>
+      <span id="insp-status">Idle</span>
+    </div>
+
+    <div class="capture-output" id="insp-output"><span class="placeholder">Waiting for capture to start…</span></div>
+
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeInspectModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let usersMap = {}; // id → {name, org}
+let rulesCache = []; // last-loaded rules, used to populate the inspect modal
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function showAlert(id, msg, show = true) {
@@ -496,6 +622,12 @@ function endpointTypeBadge(etype) {
   };
   const [cls, label] = map[etype] || ["", etype];
   return `<span class="badge ${cls}">${label}</span>`;
+}
+
+function directionBadge(r) {
+  return r.direction === "outbound"
+    ? `<span class="badge badge-purple" title="Pins the source port of new outbound connections from this endpoint">↑ Outbound</span>`
+    : `<span class="badge badge-blue" title="Forwards new incoming connections to this endpoint">↓ Inbound</span>`;
 }
 
 function displayName(r) {
@@ -540,6 +672,13 @@ function updateEndpointFields() {
   document.querySelectorAll(".ep-ipsec").forEach(el   => el.style.display = type === "ipsec"   ? "" : "none");
 }
 
+// ── Direction field toggling (inbound: ext/int ports — outbound: source port + dest ip) ──
+function updateDirectionFields() {
+  const dir = document.getElementById("f-direction").value;
+  document.querySelectorAll(".dir-inbound").forEach(el  => el.style.display = dir === "inbound"  ? "" : "none");
+  document.querySelectorAll(".dir-outbound").forEach(el => el.style.display = dir === "outbound" ? "" : "none");
+}
+
 // ── Load data ──────────────────────────────────────────────────────────────
 async function loadUsers() {
   const res = await fetch("/api/users");
@@ -577,6 +716,7 @@ async function loadStatus() {
     document.getElementById("stat-active").textContent    = s.rules_active;
     document.getElementById("stat-clients").textContent   = s.clients_online;
     document.getElementById("stat-conflicts").textContent = s.conflicts;
+    document.getElementById("stat-importable").textContent = s.importable;
     document.getElementById("stat-time").textContent      = new Date().toLocaleTimeString();
 
     const dot   = document.getElementById("mongo-dot");
@@ -591,6 +731,7 @@ async function loadStatus() {
 async function loadRules() {
   const res = await fetch("/api/rules");
   const rules = await res.json();
+  rulesCache = rules;
   const tbody = document.getElementById("rules-body");
   if (!rules.length) {
     tbody.innerHTML = `<tr class="empty-row"><td colspan="9">No rules defined. Add one above.</td></tr>`;
@@ -598,22 +739,33 @@ async function loadRules() {
   }
   tbody.innerHTML = rules.map(r => {
     const sub = subText(r);
+    const isOutbound = r.direction === "outbound";
+
+    const portCells = isOutbound
+      ? `<td colspan="3"><span class="mono">src ${esc(r.source_port || '—')}</span></td>`
+      : `<td><span class="mono">${esc(r.external_port)}</span></td>
+         <td style="color:var(--muted)">→</td>
+         <td><span class="mono">${esc(r.internal_port)}</span></td>`;
+
+    const targetCell = isOutbound
+      ? `<span class="mono" style="color:var(--muted);font-size:12px">${r.destination_ip ? '→ ' + esc(r.destination_ip) : '→ any destination'}</span>`
+      : `<span class="mono" style="color:var(--muted);font-size:12px">${esc(r.target_ip) || '—'}</span>`;
+
     return `<tr data-id="${r.id}">
       <td>
         <div style="font-weight:500">${esc(displayName(r))}</div>
-        <div style="margin-top:3px">${endpointTypeBadge(r.endpoint_type)}
+        <div style="margin-top:3px">${endpointTypeBadge(r.endpoint_type)} ${directionBadge(r)}
           ${sub ? `<span class="mono" style="font-size:11px;color:var(--muted);margin-left:4px">${esc(sub)}</span>` : ''}
         </div>
       </td>
       <td>${protoBadge(r.proto)}</td>
-      <td><span class="mono">${r.external_port}</span></td>
-      <td style="color:var(--muted)">→</td>
-      <td><span class="mono">${r.internal_port}</span></td>
-      <td><span class="mono" style="color:var(--muted);font-size:12px">${esc(r.target_ip) || '—'}</span></td>
+      ${portCells}
+      <td>${targetCell}</td>
       <td>${statusBadge(r)}</td>
       <td style="color:var(--muted);font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
           title="${esc(r.comment)}">${esc(r.comment || '')}</td>
-      <td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-secondary btn-sm" onclick="openInspectModal('${r.id}')" title="Peek at live traffic for this rule">👁</button>
         <button class="btn btn-danger" onclick="deleteRule('${r.id}', '${esc(displayName(r))}')"
                 title="Delete rule">✕</button>
       </td>
@@ -630,16 +782,30 @@ async function addRule() {
   hideAlert("form-error");
   hideAlert("form-ok");
 
-  const etype  = document.getElementById("f-endpoint-type").value;
-  const proto  = document.getElementById("f-proto").value;
-  const extPort = document.getElementById("f-ext").value;
-  const intPort = document.getElementById("f-int").value;
-  const comment = document.getElementById("f-comment").value;
+  const etype     = document.getElementById("f-endpoint-type").value;
+  const direction = document.getElementById("f-direction").value;
+  const proto     = document.getElementById("f-proto").value;
+  const comment   = document.getElementById("f-comment").value;
 
-  if (!extPort) { showAlert("form-error", "External port is required."); return; }
-  if (!intPort) { showAlert("form-error", "Internal port is required."); return; }
+  let payload = { endpoint_type: etype, direction, proto, comment };
+  let summary = "";
 
-  let payload = { endpoint_type: etype, proto, external_port: extPort, internal_port: intPort, comment };
+  if (direction === "inbound") {
+    const extPort = document.getElementById("f-ext").value;
+    const intPort = document.getElementById("f-int").value;
+    if (!extPort) { showAlert("form-error", "External port is required."); return; }
+    if (!intPort) { showAlert("form-error", "Internal port is required."); return; }
+    payload.external_port = extPort;
+    payload.internal_port = intPort;
+    summary = `${proto.toUpperCase()} :${extPort} → :${intPort}`;
+  } else {
+    const srcPort = document.getElementById("f-source-port").value;
+    const destIp  = document.getElementById("f-dest-ip").value.trim();
+    if (!srcPort) { showAlert("form-error", "Source port is required."); return; }
+    payload.source_port = srcPort;
+    if (destIp) payload.destination_ip = destIp;
+    summary = `${proto.toUpperCase()} src-port pinned to :${srcPort}` + (destIp ? ` → ${destIp}` : "");
+  }
 
   if (etype === "pritunl") {
     const sel = document.getElementById("f-user");
@@ -670,6 +836,8 @@ async function addRule() {
   if (res.ok) {
     document.getElementById("f-ext").value = "";
     document.getElementById("f-int").value = "";
+    document.getElementById("f-source-port").value = "";
+    document.getElementById("f-dest-ip").value = "";
     document.getElementById("f-comment").value = "";
     if (etype === "static") {
       document.getElementById("f-static-ip").value = "";
@@ -680,7 +848,7 @@ async function addRule() {
       document.getElementById("f-ipsec-ip").value = "";
       document.getElementById("f-ipsec-label").value = "";
     }
-    showAlert("form-ok", `Rule added: ${proto.toUpperCase()} :${extPort} → :${intPort}`);
+    showAlert("form-ok", `Rule added: ${summary}`);
     setTimeout(() => hideAlert("form-ok"), 4000);
     loadAll();
   } else {
@@ -694,6 +862,135 @@ async function deleteRule(id, name) {
   const res = await fetch(`/api/rules/${id}`, { method: "DELETE" });
   if (res.ok) loadAll();
   else alert("Failed to delete rule.");
+}
+
+// ── Discovered existing iptables rules (import) ────────────────────────────
+async function loadImportable() {
+  try {
+    const res = await fetch("/api/importable-rules");
+    const items = await res.json();
+    const card = document.getElementById("importable-card");
+    const body = document.getElementById("importable-body");
+    if (!items.length) { card.style.display = "none"; return; }
+    card.style.display = "";
+    body.innerHTML = items.map(c => `
+      <tr>
+        <td>${protoBadge(c.proto)}</td>
+        <td><span class="mono">${esc(c.external_port)}</span></td>
+        <td style="color:var(--muted)">→</td>
+        <td><span class="mono">${esc(c.target_ip)}:${esc(c.internal_port)}</span></td>
+        <td><button class="btn btn-secondary btn-sm" onclick="importRule('${c.id}')">Import</button></td>
+      </tr>`).join("");
+  } catch (e) { /* daemon not reporting yet — leave card hidden */ }
+}
+
+async function importRule(id) {
+  const res = await fetch("/api/import-rule", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id })
+  });
+  if (res.ok) {
+    loadImportable();
+    setTimeout(loadAll, 11000); // give the daemon's next cycle time to apply it
+  } else {
+    const data = await res.json();
+    alert(data.error || "Failed to queue import.");
+  }
+}
+
+// ── Inspect (tcpdump) modal ─────────────────────────────────────────────────
+let captureSessionId = null;
+let capturePollHandle = null;
+
+function openInspectModal(ruleId) {
+  const rule = rulesCache.find(r => r.id === ruleId);
+  if (!rule) return;
+  document.getElementById("inspect-title").textContent = `Inspect: ${displayName(rule)}`;
+  document.getElementById("insp-ip").value = "";
+  document.getElementById("insp-port").value = "";
+  document.getElementById("insp-proto").value = "";
+  document.getElementById("insp-output").innerHTML = '<span class="placeholder">Starting capture…</span>';
+  document.getElementById("inspect-modal").dataset.ruleId = ruleId;
+  document.getElementById("inspect-modal").classList.add("show");
+  startCaptureSession();
+}
+
+async function startCaptureSession() {
+  const ruleId = document.getElementById("inspect-modal").dataset.ruleId;
+  const extra_ip = document.getElementById("insp-ip").value.trim();
+  const extra_port = document.getElementById("insp-port").value.trim();
+  const extra_proto = document.getElementById("insp-proto").value;
+
+  setInspectStatus("warn", "Starting…");
+  const res = await fetch("/api/capture/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ rule_id: ruleId, extra_ip, extra_port, extra_proto })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    setInspectStatus("err", data.error || "Failed to start capture");
+    return;
+  }
+  captureSessionId = data.session_id;
+  if (capturePollHandle) clearInterval(capturePollHandle);
+  capturePollHandle = setInterval(pollCaptureLog, 1000);
+  pollCaptureLog();
+}
+
+async function restartCapture() {
+  if (captureSessionId) {
+    await fetch("/api/capture/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: captureSessionId })
+    });
+  }
+  document.getElementById("insp-output").innerHTML = '<span class="placeholder">Restarting with new filter…</span>';
+  startCaptureSession();
+}
+
+function setInspectStatus(kind, text) {
+  const dot = document.getElementById("insp-dot");
+  dot.className = "status-dot " + (kind === "ok" ? "ok" : kind === "err" ? "err" : "warn");
+  document.getElementById("insp-status").textContent = text;
+}
+
+async function pollCaptureLog() {
+  if (!captureSessionId) return;
+  try {
+    const res = await fetch(`/api/capture/${captureSessionId}/log`);
+    const data = await res.json();
+    if (data.state === "error") {
+      setInspectStatus("err", data.message || "Error");
+    } else if (data.state === "running") {
+      setInspectStatus("ok", data.message || "Capturing…");
+    } else {
+      setInspectStatus("warn", data.message || data.state);
+    }
+    const out = document.getElementById("insp-output");
+    if (data.lines && data.lines.length) {
+      out.textContent = data.lines.join("\n");
+      out.scrollTop = out.scrollHeight;
+    } else if (data.state === "running") {
+      out.innerHTML = '<span class="placeholder">Capturing — no matching packets seen yet…</span>';
+    }
+  } catch (e) { /* transient — next poll will retry */ }
+}
+
+async function closeInspectModal() {
+  document.getElementById("inspect-modal").classList.remove("show");
+  if (capturePollHandle) { clearInterval(capturePollHandle); capturePollHandle = null; }
+  if (captureSessionId) {
+    const sid = captureSessionId;
+    captureSessionId = null;
+    await fetch("/api/capture/stop", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sid })
+    });
+  }
 }
 
 // ── Password modal ─────────────────────────────────────────────────────────
@@ -734,15 +1031,23 @@ async function changePassword() {
 
 // ── Init ───────────────────────────────────────────────────────────────────
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") closePasswordModal();
+  if (e.key !== "Escape") return;
+  closePasswordModal();
+  if (document.getElementById("inspect-modal").classList.contains("show")) closeInspectModal();
+});
+document.getElementById("inspect-modal").addEventListener("click", e => {
+  if (e.target.id === "inspect-modal") closeInspectModal();
 });
 
 updateEndpointFields();
+updateDirectionFields();
 loadUsers();
 loadIpsecTunnels();
 loadAll();
+loadImportable();
 setInterval(loadAll, 15000);
 setInterval(loadIpsecTunnels, 30000);
+setInterval(loadImportable, 15000);
 </script>
 </body>
 </html>

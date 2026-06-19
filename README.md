@@ -8,6 +8,12 @@ A self-hosted web UI and background daemon that lets you define TCP/UDP port for
 - **Static / local IPs** — forwards to any fixed IP reachable from the server (a LAN device, another VLAN, anything routable)
 - **IPsec tunnel endpoints** — forwards to a fixed IP reachable through a named StrongSwan/IPsec connection, with tunnel health surfaced in the UI
 
+Beyond basic forwarding:
+- **Port ranges** on either side of a rule (`8000-8010`), not just single ports
+- **Outbound rules** that pin the source port of an endpoint's outgoing connections via SNAT — for remote services that expect traffic from one fixed, predictable port
+- **Import** of pre-existing iptables port-forward rules already on the host, so they become fully managed by this tool
+- **Live traffic inspection** — peek at a rule's traffic with `tcpdump`, filterable by IP/port/protocol, running only while you have it open
+
 Before any rule is applied, it's checked against ports already in use locally and against pre-existing iptables rules, so it won't silently steal traffic from another service.
 
 Works with **Pritunl Community Edition** — no Enterprise subscription required.
@@ -18,9 +24,10 @@ Works with **Pritunl Community Edition** — no Enterprise subscription required
 
 The web UI uses a dark admin theme consistent with Pritunl's own interface:
 
-- **Dashboard** — live stats (total rules, active forwards, clients online, conflicts)
-- **Rules table** — per-endpoint rules with live status (connected/offline, static, tunnel up/down, or conflict)
-- **Add rule form** — pick an endpoint type (Pritunl user / static IP / IPsec tunnel), set ports
+- **Dashboard** — live stats (total rules, active forwards, clients online, conflicts, discovered/importable rules)
+- **Rules table** — per-endpoint rules with live status (connected/offline, static, tunnel up/down, or conflict), direction (inbound/outbound), and a one-click traffic inspector
+- **Add rule form** — pick an endpoint type (Pritunl user / static IP / IPsec tunnel) and direction (inbound / outbound), set ports or port ranges
+- **Discovered rules panel** — one-click import of pre-existing, unmanaged iptables rules
 - **Password management** — change admin password from within the UI
 
 ---
@@ -33,18 +40,24 @@ Internet
    ▼  e.g. TCP :8443
 VPN Server (public IP)
    │
-   │  iptables PREROUTING DNAT
+   │  iptables PREROUTING DNAT  (inbound rules)
    ▼
    ├── Pritunl VPN user's virtual IP   (e.g. 10.10.10.5:443)  — dynamic, gated on connection
    ├── Static / local IP               (e.g. 192.168.1.50:443) — persistent
    └── IP reachable via IPsec tunnel   (e.g. 10.20.0.5:443)    — persistent, tunnel health tracked
+
+   ▲
+   │  iptables POSTROUTING MASQUERADE  (outbound rules — pins the source port
+   │  of NEW outgoing connections from one of the endpoints above)
+   │
+Internet
 ```
 
 1. **`daemon.py`** (runs as root) polls Pritunl's MongoDB every 10 seconds for connected clients, and checks StrongSwan tunnel health on a slower interval.
-2. For each rule, it resolves a target IP based on the rule's `endpoint_type` — looked up dynamically for Pritunl users, or read directly from the rule for static/IPsec rules — then applies or removes the matching `iptables` DNAT rule.
-3. Before applying any rule, it checks for a port already bound by a local service, and for any pre-existing (non-portfwd) iptables rule on the same port — conflicts are skipped and reported rather than applied blindly.
-4. The daemon writes a status snapshot (`/etc/pritunl-portfwd/status.json`) describing what's currently applied, tunnel health, and any conflicts.
-5. **`app.py`** (runs unprivileged) serves the web UI, reading rule definitions from `/etc/pritunl-portfwd/rules.json` and live status from the daemon's snapshot — it never touches `iptables` or StrongSwan directly.
+2. For each rule, it resolves a target IP based on the rule's `endpoint_type` — looked up dynamically for Pritunl users, or read directly from the rule for static/IPsec rules — then, based on the rule's `direction`, applies or removes either a `PREROUTING` DNAT rule (inbound) or a `POSTROUTING` MASQUERADE rule (outbound, source-port pinning).
+3. Before applying any inbound rule, it checks for a port already bound by a local service, and for any pre-existing (non-portfwd) iptables rule on the same port — conflicts are skipped and reported rather than applied blindly. It also scans for pre-existing DNAT rules it doesn't own and surfaces them as importable.
+4. The daemon writes a status snapshot (`/etc/pritunl-portfwd/status.json`) describing what's currently applied, tunnel health, conflicts, and discovered/importable rules — and, on a sub-second loop independent of the main sync, services tcpdump capture start/stop requests for the live traffic inspector.
+5. **`app.py`** (runs unprivileged) serves the web UI, reading rule definitions from `/etc/pritunl-portfwd/rules.json` and live status from the daemon's snapshot — it never touches `iptables`, StrongSwan, or `tcpdump` directly. Anything that needs root (applying rules, importing a discovered rule, running a capture) goes through a request file the daemon picks up.
 
 ---
 
@@ -159,21 +172,79 @@ Forwards to a fixed IP reachable through a named StrongSwan/IPsec site-to-site c
 1. Open the web UI
 2. Choose the **Endpoint Type**
 3. Fill in the fields shown for that type (VPN user dropdown, or target IP + label, or tunnel name + target IP + label)
-4. Choose **Protocol**: TCP, UDP, or TCP+UDP (both)
-5. Set **External Port** (the port on the VPN server's public IP that traffic arrives on) and **Internal Port** (the port to forward to)
-6. Optionally add a **Comment**
-7. Click **Add Rule**
+4. Choose **Direction**: `Inbound` (forward incoming connections to this endpoint) or `Outbound` (pin the source port of this endpoint's outgoing connections — see [Outbound rules](#outbound-rules--pinning-a-source-port-snat) below)
+5. Choose **Protocol**: TCP, UDP, or TCP+UDP (both)
+6. For inbound rules, set **External Port(s)** and **Internal Port(s)** — either can be a single port (`8443`) or a range (`8000-8010`), see [Port ranges](#port-ranges) below. For outbound rules, set the **Source Port(s)** to pin to and, optionally, a **Destination IP** to scope the pin to one external service.
+7. Optionally add a **Comment**
+8. Click **Add Rule**
 
 The daemon picks up the new rule within ~10 seconds (Pritunl-type rules apply immediately if the user is already connected; static/IPsec rules apply on the next sync regardless of any VPN state).
 
+### Port ranges
+
+Both `external_port` and `internal_port` on an inbound rule accept either a single port (`8443`) or a range (`8000-8010`). Valid combinations:
+
+| External | Internal | Behavior |
+|---|---|---|
+| single | single | the original, simple case |
+| range | single | many-to-one — all ports in the external range forward to the same internal port |
+| single | range | one-to-many — iptables load-balances the single matched port across the internal range |
+| range | range (same size) | parallel, offset-preserving mapping (e.g. `8000-8010` → `9000-9010` maps `8000→9000`, `8001→9001`, …) |
+
+Two differently-sized ranges on both sides aren't supported — that isn't something a single iptables rule can express. The web UI validates this when you add a rule, and the daemon re-validates it on every sync.
+
+### Outbound rules — pinning a source port (SNAT)
+
+Some external services expect **all** traffic from a device to arrive from one fixed, predictable source port, rather than the arbitrary port a normal outbound connection (and Pritunl's own default MASQUERADE) would use. A concrete example:
+
+```
+1.2.3.4  →  VPN  →  192.1.2.3:5000    inbound:  external service connects in on :5000
+192.1.2.3  →  VPN  →  1.2.3.4          outbound: 192.1.2.3 must appear to originate from :5001
+```
+
+An **outbound** rule handles the second leg: it inserts an SNAT/MASQUERADE rule that rewrites the source port of new outgoing connections from the chosen endpoint to a fixed port (or pool of ports, if you give it a range), using `MASQUERADE --to-ports` so the egress IP itself is whatever this host's outbound interface already uses — no need to hardcode the server's public IP.
+
+Two implementation details matter and are handled for you:
+
+- The rule is inserted at the **top** of the `POSTROUTING` chain (`-I POSTROUTING 1`), not appended. Pritunl already installs its own broad MASQUERADE rule there for general client internet access, and the kernel stops at the *first* matching rule for each new connection — appending after Pritunl's rule would mean ours never gets reached.
+- An optional **Destination IP** scopes the pin to traffic going to one specific external service, so it doesn't affect the endpoint's other outbound traffic.
+
+**Important limitation:** this only affects *genuinely new* outbound connections. Once a connection is established, the kernel reuses its cached NAT translation (via conntrack) for all subsequent packets on that connection without re-consulting the nat table at all — so an outbound rule cannot redirect or reposition the source port of a connection that's already underway. If you need this kind of pinning, it has to be in place *before* the connection that needs it gets established.
+
+A rule's `direction` (inbound/outbound) is independent of its `endpoint_type` (pritunl/static/ipsec) — an outbound rule can pin a Pritunl VPN user's connection just as easily as a static IP's.
+
+### Importing existing iptables rules
+
+If this host already has DNAT port-forward rules that predate this tool (set up by hand, or by other tooling), they show up automatically in a **Discovered Existing iptables Rules** card above the main rules table — the daemon scans `PREROUTING` every cycle for DNAT rules it doesn't own.
+
+Click **Import** on any discovered rule and, within ~10 seconds:
+1. The original raw iptables rule (and its matching `FORWARD` ACCEPT rule, if found) is deleted
+2. An equivalent entry is added to `rules.json`, tagged and managed like any rule you created in the UI
+3. It becomes fully editable/deletable from the main rules table from then on
+
+The daemon guesses `endpoint_type` on import: if the rule's target IP matches a *currently connected* Pritunl client's virtual IP, it's imported as a `pritunl` rule; otherwise it's imported as a `static` rule labeled "Imported rule" (you can edit the label afterward). Imported rules always come in as `direction: inbound`, since that's the only thing a `PREROUTING` DNAT rule can represent.
+
+### Traffic inspection (tcpdump)
+
+Click the **👁** button on any rule to open a live traffic inspector for it. While the modal is open, the daemon runs a `tcpdump` filtered to that rule's target IP/port(s) (plus an optional IP/port/protocol filter you can narrow it with), and the modal polls and displays the latest output roughly once a second.
+
+A few things worth knowing:
+- The capture **only runs while the modal is open** — closing it (or pressing Escape, or clicking outside it) stops `tcpdump` immediately.
+- There's a 10-minute (`MAX_CAPTURE_SECONDS`) safety auto-stop in case a browser tab gets left open and forgotten.
+- This is intentionally a live "peek," not a logging tool — no capture history is retained after a session ends; the log file is deleted on stop.
+- Requires `tcpdump` to be installed (the installer adds it automatically; if it's missing, the modal shows an inline error with the install command instead of failing silently).
+- Like the rest of this tool's privilege model, the unprivileged web UI never runs `tcpdump` itself — it only queues a request that the root daemon acts on, and every filter value is re-validated by the daemon before it ever reaches `tcpdump`'s command line.
+
 ### Conflict detection
 
-Two layers of checking happen before a rule is actually applied:
+This applies to **inbound** rules — outbound rules don't bind a listening port, so the "is this port already in use" question doesn't apply to them (see the separate outbound check below). Two layers of checking happen before an inbound rule is actually applied:
 
-1. **Immediate (web UI)** — when you click Add Rule, the UI reads `/proc/net/tcp` and `/proc/net/udp` to check whether some other local process is already bound to that external port. If so, the rule is rejected outright with a `409` error, since a DNAT rule on that port would otherwise hijack traffic meant for the existing service (DNAT in `PREROUTING` happens before local delivery).
-2. **Deeper (daemon)** — every sync cycle (~10s), the daemon also checks the existing `iptables -t nat -S PREROUTING` ruleset for any rule on that port/proto *not* tagged by this tool — e.g. something added manually or by other tooling. If found, that specific rule is skipped and surfaced in the UI as a **⚠ Conflict** badge (hover for the reason) rather than being silently applied or silently dropped.
+1. **Immediate (web UI)** — when you click Add Rule, the UI reads `/proc/net/tcp` and `/proc/net/udp` to check whether some other local process is already bound to that external port (or any port in the range, if you used one). If so, the rule is rejected outright with a `409` error, since a DNAT rule on that port would otherwise hijack traffic meant for the existing service (DNAT in `PREROUTING` happens before local delivery).
+2. **Deeper (daemon)** — every sync cycle (~10s), the daemon also checks the existing `iptables -t nat -S PREROUTING` ruleset for any rule with an *overlapping* port range on that proto *not* tagged by this tool — e.g. something added manually or by other tooling. If found, that specific rule is skipped and surfaced in the UI as a **⚠ Conflict** badge (hover for the reason) rather than being silently applied or silently dropped.
 
 The deeper check can only run in the daemon because reading `iptables` requires root; the immediate check works for any user since `/proc/net/*` is world-readable.
+
+**Outbound rules** get a simpler, config-level check instead: when you add one, the UI checks whether another existing outbound rule already pins the *same* source endpoint to an overlapping source port for an overlapping destination scope, and rejects the new rule with a `409` if so. This doesn't need root/iptables access, since outbound rules are always inserted at the top of the chain — there's no "shadowed by an earlier rule" scenario to detect the way there is for inbound rules.
 
 ### Rule status badges
 
@@ -218,6 +289,14 @@ STATUS_FILE=/etc/pritunl-portfwd/status.json
 # Path to config file (stores password hash)
 CONFIG_FILE=/etc/pritunl-portfwd/config.json
 
+# Queue files for the privilege-separated async actions below — the
+# unprivileged web UI writes a request, the root daemon acts on it and
+# clears the queue on its next cycle (or, for captures, within ~1s).
+IMPORT_REQUESTS_FILE=/etc/pritunl-portfwd/import_requests.json
+CAPTURE_REQUESTS_FILE=/etc/pritunl-portfwd/capture_requests.json
+CAPTURE_STATUS_FILE=/etc/pritunl-portfwd/capture_status.json
+CAPTURE_LOG_DIR=/etc/pritunl-portfwd/captures
+
 # Pritunl MongoDB connection
 MONGO_URI=mongodb://localhost:27017/
 MONGO_DB=pritunl
@@ -233,6 +312,10 @@ POLL_SECS=10
 # Only relevant if you use IPsec-type rules — each check spawns a
 # subprocess, so it's checked less often than the main sync loop.
 IPSEC_POLL_EVERY=3
+
+# Safety auto-stop for the tcpdump "Inspect" feature (seconds), in case a
+# browser tab gets left open and forgotten.
+MAX_CAPTURE_SECONDS=600
 ```
 
 After editing, restart both services:
@@ -242,50 +325,67 @@ sudo systemctl restart pritunl-portfwd-ui pritunl-portfwd-daemon
 
 ### Rules file
 
-Rules are stored as JSON at `/etc/pritunl-portfwd/rules.json`. Each rule has an `endpoint_type` of `pritunl`, `static`, or `ipsec`, with type-specific fields:
+Rules are stored as JSON at `/etc/pritunl-portfwd/rules.json`. Every rule has an `endpoint_type` (`pritunl`, `static`, or `ipsec`) and a `direction` (`inbound` or `outbound`), with direction-specific port fields:
 
 ```json
 [
   {
     "id": "a1b2c3d4",
     "endpoint_type": "pritunl",
+    "direction": "inbound",
     "user_id": "64f2a1b3c4d5e6f7a8b9c0d1",
     "user_name": "alice",
     "proto": "tcp",
-    "external_port": 8443,
-    "internal_port": 443,
+    "external_port": "8443",
+    "internal_port": "443",
     "comment": "Alice's home web server",
     "created_at": "2024-01-15T12:00:00.000000"
   },
   {
     "id": "e5f6a7b8",
     "endpoint_type": "static",
+    "direction": "inbound",
     "target_ip": "192.168.1.50",
     "label": "NAS Server",
     "proto": "tcp",
-    "external_port": 2222,
-    "internal_port": 22,
-    "comment": "",
+    "external_port": "8000-8010",
+    "internal_port": "8000-8010",
+    "comment": "Range mapping, offset-preserving",
     "created_at": "2024-01-15T12:05:00.000000"
   },
   {
     "id": "c9d0e1f2",
     "endpoint_type": "ipsec",
+    "direction": "inbound",
     "target_ip": "10.20.0.5",
     "tunnel_name": "site-b",
     "label": "Site B File Server",
     "proto": "tcp",
-    "external_port": 8080,
-    "internal_port": 80,
+    "external_port": "8080",
+    "internal_port": "80",
     "comment": "",
     "created_at": "2024-01-15T12:10:00.000000"
+  },
+  {
+    "id": "f1a2b3c4",
+    "endpoint_type": "static",
+    "direction": "outbound",
+    "target_ip": "192.1.2.3",
+    "label": "Pinned callback source port",
+    "proto": "tcp",
+    "source_port": "5001",
+    "destination_ip": "1.2.3.4",
+    "comment": "External service expects all traffic from a fixed source port",
+    "created_at": "2024-01-15T12:15:00.000000"
   }
 ]
 ```
 
+Note that for `direction: outbound`, `target_ip` identifies the **source** endpoint (the device whose outbound traffic gets pinned), not a forwarding destination — `resolve_target()` in the daemon works identically either way, only the `direction` field changes how the resolved IP is used.
+
 > **Tip:** Changes to the rules file are picked up automatically by the daemon on its next sync cycle. No restart needed.
 
-> **Migrating from an older version:** rules created before endpoint types existed don't have an `endpoint_type` field. They're treated as `pritunl` automatically — no manual migration needed, and your existing `user_id`-based rules keep working exactly as before.
+> **Migrating from an older version:** rules created before endpoint types existed don't have an `endpoint_type` field (treated as `pritunl` automatically), and rules created before ranges/outbound rules existed have plain integer `external_port`/`internal_port` values and no `direction` field (treated as `direction: inbound` automatically). No manual migration needed either way.
 
 ---
 
@@ -374,6 +474,11 @@ Compare against the regex patterns in `get_ipsec_status()` in `daemon.py` and ad
 - Sessions are server-side; change the `SECRET_KEY` env var to invalidate all sessions
 - For production use, put the UI behind nginx with TLS
 
+### Traffic inspection (tcpdump)
+- The web UI never invokes `tcpdump` itself — it only writes a capture *request*; the root daemon is the only thing that ever spawns the process, and it re-validates every filter value (IP/port/protocol) server-side before building the `tcpdump` command line, regardless of what the browser sent
+- Capture logs are deleted as soon as a session stops — there's no retained traffic history sitting on disk between sessions
+- Anyone with admin access to the UI can capture any traffic flowing through any rule — treat admin UI access with the same care you'd give direct root/SSH access to this host
+
 ---
 
 ## Troubleshooting
@@ -394,19 +499,26 @@ Verify MongoDB is accessible: `mongo --eval "db.adminCommand('ping')" --quiet`
 
 ### Check active iptables rules
 ```bash
-# See all portfwd DNAT rules
+# See all portfwd DNAT rules (inbound)
 sudo iptables -t nat -L PREROUTING -n --line-numbers | grep pritunl-portfwd
 
 # See all portfwd FORWARD rules
 sudo iptables -L FORWARD -n --line-numbers | grep pritunl-portfwd
+
+# See all portfwd SNAT/MASQUERADE rules (outbound) — these should appear
+# ABOVE Pritunl's own MASQUERADE rule; if an outbound rule isn't taking
+# effect, check it's actually rule #1 here, not below Pritunl's:
+sudo iptables -t nat -L POSTROUTING -n --line-numbers
 ```
 
 ### Manually flush all portfwd rules
 ```bash
 sudo systemctl stop pritunl-portfwd-daemon
-# The daemon flushes all its rules on clean shutdown.
-# To force-flush without restarting:
+# The daemon flushes all its rules (including outbound POSTROUTING
+# entries) on clean shutdown. To force-flush without restarting:
 sudo iptables -t nat -S PREROUTING | grep pritunl-portfwd | \
+  sed 's/-A/-D/' | xargs -r -L1 sudo iptables -t nat
+sudo iptables -t nat -S POSTROUTING | grep pritunl-portfwd | \
   sed 's/-A/-D/' | xargs -r -L1 sudo iptables -t nat
 sudo iptables -S FORWARD | grep pritunl-portfwd | \
   sed 's/-A/-D/' | xargs -r -L1 sudo iptables
@@ -419,11 +531,23 @@ The UI reads users from Pritunl's MongoDB. If the dropdown is empty:
 - Confirm the database name matches (default: `pritunl`)
 
 ### A rule shows "⚠ Conflict"
-Hover the badge for the specific reason. This means either:
+Hover the badge for the specific reason. For an **inbound** rule, this means either:
 - another process on this host is already bound to that external port (`sudo ss -tlnp | grep <port>` to identify it), or
 - a pre-existing, non-portfwd iptables rule already forwards that port/proto (`sudo iptables -t nat -S PREROUTING | grep -- '--dport <port>'`)
 
 Resolve the underlying conflict (free the port, or remove/adjust the other rule), and the daemon will pick the rule back up on its next sync cycle.
+
+### Outbound rule doesn't seem to be pinning the source port
+- Confirm `tcpdump` actually shows the connection leaving with the new source port (the [Traffic inspection](#traffic-inspection-tcpdump) modal is the easiest way to check this live) — note it only affects *new* connections, not ones already established when the rule was added (see [Outbound rules](#outbound-rules--pinning-a-source-port-snat)).
+- Check the rule is actually first in `POSTROUTING` (see `Check active iptables rules` above) — if Pritunl's own MASQUERADE rule got re-added above it (e.g. after a Pritunl service restart), it'll shadow ours until the daemon's next sync re-asserts ordering.
+- If you scoped the rule to a `destination_ip`, confirm the device is actually talking to that IP — traffic to anywhere else won't match.
+
+### "Inspect" modal shows an error about tcpdump
+`tcpdump` isn't installed on the host (the installer adds it automatically, but it can be removed afterward by other tooling/cleanup). Install it manually: `sudo apt-get install tcpdump`, no service restart needed — the next "Inspect" click will work once it's present.
+
+### "Inspect" modal opens but shows no traffic
+- Confirm the rule actually has an active target (an offline VPN user, for instance, has no `target_ip` to capture against — the modal will say so).
+- If you added an IP/port/protocol filter, double check it isn't excluding the traffic you're expecting to see — clear the filters and click **Apply Filter** to capture broadly first.
 
 ### IPsec tunnel always shows "? Tunnel Unknown"
 This means the daemon's `swanctl`/`ipsec` parser didn't match your StrongSwan output format — see [IPsec / StrongSwan Integration](#ipsec--strongswan-integration) above for how to diagnose and adjust it. The forwarding rule itself still works regardless of this status display.
@@ -431,8 +555,11 @@ This means the daemon's `swanctl`/`ipsec` parser didn't match your StrongSwan ou
 ### Checking the live status snapshot
 ```bash
 # What the daemon currently believes is applied, with target IPs,
-# tunnel health, and any conflicts:
+# tunnel health, conflicts, and discovered/importable rules:
 sudo cat /etc/pritunl-portfwd/status.json | python3 -m json.tool
+
+# Current tcpdump capture session state, if any "Inspect" modal is open:
+sudo cat /etc/pritunl-portfwd/capture_status.json | python3 -m json.tool
 ```
 
 ---
@@ -462,13 +589,23 @@ This stops and removes both services and application files. It will ask separate
 └── venv/                # Python virtualenv (created by installer)
 
 /etc/pritunl-portfwd/
-├── config.json          # Admin password hash
-├── rules.json           # Port forward rule definitions
-├── status.json           # Live status snapshot, written by daemon.py,
-│                          # read by app.py (target IPs, applied state,
-│                          # tunnel health, conflicts) — world-readable,
-│                          # contains no secrets
-└── env                  # Environment variable overrides
+├── config.json              # Admin password hash
+├── rules.json               # Port forward rule definitions
+├── status.json               # Live status snapshot, written by daemon.py,
+│                              # read by app.py (target IPs, applied state,
+│                              # tunnel health, conflicts, discovered/
+│                              # importable rules) — world-readable,
+│                              # contains no secrets
+├── import_requests.json     # Pending "import this foreign rule" requests,
+│                              # written by app.py, consumed by daemon.py
+├── capture_requests.json    # Pending tcpdump start/stop requests, written
+│                              # by app.py, consumed by daemon.py
+├── capture_status.json      # Live capture session state, written by
+│                              # daemon.py, read by app.py — world-readable
+├── captures/                 # Transient tcpdump log files — deleted as
+│                              # soon as each capture session stops; no
+│                              # history is retained between sessions
+└── env                       # Environment variable overrides
 ```
 
 ---

@@ -24,6 +24,7 @@ rules.json
 # OS
 .DS_Store
 Thumbs.db
+Zone.Identifier
 
 # Editor
 .vscode/

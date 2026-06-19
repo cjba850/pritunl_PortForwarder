@@ -2,7 +2,8 @@
 """
 pritunl-portfwd - Port Forward Manager for Pritunl VPN (Community Edition)
 Web UI for managing iptables DNAT rules targeting Pritunl VPN clients,
-static/local IPs, or IPsec (StrongSwan) tunnel endpoints.
+static/local IPs, or IPsec (StrongSwan) tunnel endpoints — with single-port
+or port-range mappings, and discovery/import of pre-existing iptables rules.
 """
 
 import os
@@ -19,9 +20,13 @@ from flask import (
 
 from common import (
     load_rules, save_rules, load_status,
-    gen_rule_id, valid_ip, valid_port,
-    get_local_listening_ports,
-    VALID_ENDPOINT_TYPES, VALID_PROTOS,
+    load_import_requests, save_import_requests,
+    load_capture_requests, save_capture_requests,
+    load_capture_status, capture_log_path,
+    gen_rule_id, gen_session_id, valid_ip,
+    parse_port_spec, valid_port_spec, ranges_compatible, ranges_overlap,
+    expand_protos, get_local_listening_ports,
+    VALID_ENDPOINT_TYPES, VALID_PROTOS, VALID_DIRECTIONS,
 )
 
 # ---------------------------------------------------------------------------
@@ -226,6 +231,7 @@ def api_status():
         "rules_total": len(rules),
         "rules_active": active_count,
         "conflicts": len(status.get("conflicts", [])),
+        "importable": len(status.get("importable", [])),
         "clients_online": len(get_active_clients()),
     })
 
@@ -251,6 +257,73 @@ def api_get_rules():
     return jsonify(enriched)
 
 
+def _validate_inbound_ports(data, errors):
+    """external_port/internal_port, range-aware. Returns (ext_spec, int_spec)
+    as normalized strings, or (None, None) if invalid."""
+    ext_raw = data.get("external_port")
+    int_raw = data.get("internal_port")
+
+    if not valid_port_spec(ext_raw):
+        errors.append("external_port must be a port (1-65535) or a range like 8000-8010")
+    if not valid_port_spec(int_raw):
+        errors.append("internal_port must be a port (1-65535) or a range like 8000-8010")
+    if errors:
+        return None, None
+
+    ext_low, ext_high = parse_port_spec(ext_raw)
+    int_low, int_high = parse_port_spec(int_raw)
+
+    if not ranges_compatible(ext_low, ext_high, int_low, int_high):
+        errors.append(
+            f"external range ({ext_low}-{ext_high}) and internal range "
+            f"({int_low}-{int_high}) aren't compatible — ranges on both "
+            f"sides must either match in size, or one side must be a "
+            f"single port"
+        )
+        return None, None
+
+    return str(ext_raw).strip(), str(int_raw).strip()
+
+
+def _find_outbound_duplicate(rules, etype, user_id, target_ip, destination_ip, protos_to_check, src_low, src_high):
+    """
+    Cross-rule duplicate check for outbound rules: flags another existing
+    outbound rule that pins the same source endpoint to an overlapping
+    source port for an overlapping destination + protocol. Unlike inbound
+    conflicts, this doesn't need root/iptables - it's purely a check
+    against our own stored config, since outbound rules are always
+    inserted at the top of POSTROUTING (no shadowing-by-other-rules risk
+    to detect).
+    """
+    for r in rules:
+        if r.get("direction") != "outbound":
+            continue
+        # Same source endpoint?
+        same_source = False
+        if etype == "pritunl" and r.get("endpoint_type") == "pritunl":
+            same_source = r.get("user_id") == user_id
+        elif etype in ("static", "ipsec") and r.get("endpoint_type") in ("static", "ipsec"):
+            same_source = r.get("target_ip") == target_ip
+        if not same_source:
+            continue
+
+        r_dest = r.get("destination_ip") or None
+        if destination_ip and r_dest and destination_ip != r_dest:
+            continue  # different specific destinations - no overlap
+
+        r_protos = ["tcp", "udp"] if r.get("proto") == "both" else [r.get("proto")]
+        if not (set(protos_to_check) & set(r_protos)):
+            continue
+
+        try:
+            r_low, r_high = parse_port_spec(r.get("source_port"))
+        except (ValueError, TypeError):
+            continue
+        if ranges_overlap(src_low, src_high, r_low, r_high):
+            return r
+    return None
+
+
 @app.route("/api/rules", methods=["POST"])
 @login_required
 def api_add_rule():
@@ -261,16 +334,13 @@ def api_add_rule():
     if etype not in VALID_ENDPOINT_TYPES:
         errors.append("endpoint_type must be one of: pritunl, static, ipsec")
 
+    direction = str(data.get("direction", "inbound")).strip()
+    if direction not in VALID_DIRECTIONS:
+        errors.append("direction must be 'inbound' or 'outbound'")
+
     proto = str(data.get("proto", "")).lower().strip()
     if proto not in VALID_PROTOS:
         errors.append("proto must be tcp, udp, or both")
-
-    ext_port_raw = data.get("external_port")
-    int_port_raw = data.get("internal_port")
-    if not valid_port(ext_port_raw):
-        errors.append("external_port must be 1–65535")
-    if not valid_port(int_port_raw):
-        errors.append("internal_port must be 1–65535")
 
     comment = str(data.get("comment", "")).strip()[:120]
 
@@ -297,40 +367,76 @@ def api_add_rule():
         if not tunnel_name:
             errors.append("tunnel_name is required for endpoint_type 'ipsec'")
 
-    if errors:
-        return jsonify(error="; ".join(errors)), 400
-
-    ext_port = int(ext_port_raw)
-    int_port = int(int_port_raw)
     rules = load_rules()
-    protos_to_check = ["tcp", "udp"] if proto == "both" else [proto]
+    protos_to_check = ["tcp", "udp"] if proto == "both" else [proto] if proto in VALID_PROTOS else []
 
-    # Conflict 1: another rule in our own store already uses this port/proto
-    for r in rules:
-        r_protos = ["tcp", "udp"] if r["proto"] == "both" else [r["proto"]]
-        if r["external_port"] == ext_port and set(protos_to_check) & set(r_protos):
-            return jsonify(error=f"External port {ext_port}/{proto} is already "
-                                  f"assigned to another rule"), 409
+    if direction == "inbound":
+        ext_spec, int_spec = _validate_inbound_ports(data, errors)
+        if errors:
+            return jsonify(error="; ".join(errors)), 400
 
-    # Conflict 2: immediate, best-effort check against locally bound ports.
-    # (Deeper checks against pre-existing, non-portfwd iptables rules run
-    # in the daemon and surface as a "conflict" badge within ~10s.)
-    local_ports = get_local_listening_ports()
-    for p in protos_to_check:
-        if ext_port in local_ports.get(p, set()):
-            return jsonify(error=f"Port {ext_port}/{p} is already in use by a "
-                                  f"local service on this host — choose a "
-                                  f"different external port"), 409
+        ext_low, ext_high = parse_port_spec(ext_spec)
 
-    new_rule = {
-        "id": gen_rule_id(),
-        "endpoint_type": etype,
-        "proto": proto,
-        "external_port": ext_port,
-        "internal_port": int_port,
-        "comment": comment,
-        "created_at": datetime.utcnow().isoformat(),
-    }
+        for r in rules:
+            if r.get("direction", "inbound") != "inbound":
+                continue
+            try:
+                r_low, r_high = parse_port_spec(r["external_port"])
+            except (ValueError, KeyError):
+                continue
+            r_protos = ["tcp", "udp"] if r["proto"] == "both" else [r["proto"]]
+            if set(protos_to_check) & set(r_protos) and ranges_overlap(ext_low, ext_high, r_low, r_high):
+                return jsonify(error=f"External port(s) {ext_spec}/{proto} overlap "
+                                      f"with an existing rule ({r['external_port']})"), 409
+
+        local_ports = get_local_listening_ports()
+        for p in protos_to_check:
+            local_set = local_ports.get(p, set())
+            if any(port in local_set for port in range(ext_low, ext_high + 1)):
+                return jsonify(error=f"Port(s) {ext_spec}/{p} are already in use by a "
+                                      f"local service on this host — choose a "
+                                      f"different external port"), 409
+
+        new_rule = {
+            "id": gen_rule_id(),
+            "endpoint_type": etype,
+            "direction": direction,
+            "proto": proto,
+            "external_port": ext_spec,
+            "internal_port": int_spec,
+            "comment": comment,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    else:  # outbound
+        source_port_raw = data.get("source_port")
+        destination_ip = str(data.get("destination_ip", "")).strip() or None
+        if not valid_port_spec(source_port_raw):
+            errors.append("source_port must be a port (1-65535) or a range like 8000-8010")
+        if destination_ip and not valid_ip(destination_ip):
+            errors.append("destination_ip must be a valid IP if provided")
+        if errors:
+            return jsonify(error="; ".join(errors)), 400
+
+        src_low, src_high = parse_port_spec(source_port_raw)
+        dup = _find_outbound_duplicate(rules, etype, user_id, target_ip, destination_ip,
+                                        protos_to_check, src_low, src_high)
+        if dup:
+            return jsonify(error=f"This overlaps with an existing outbound rule "
+                                  f"(source port {dup.get('source_port')}, "
+                                  f"destination {dup.get('destination_ip') or 'any'})"), 409
+
+        new_rule = {
+            "id": gen_rule_id(),
+            "endpoint_type": etype,
+            "direction": direction,
+            "proto": proto,
+            "source_port": str(source_port_raw).strip(),
+            "destination_ip": destination_ip,
+            "comment": comment,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
     if etype == "pritunl":
         new_rule["user_id"] = user_id
         new_rule["user_name"] = user_name
@@ -344,7 +450,7 @@ def api_add_rule():
 
     rules.append(new_rule)
     save_rules(rules)
-    log.info(f"Rule added ({etype}): {proto} :{ext_port} -> :{int_port}")
+    log.info(f"Rule added ({etype}, {direction}): {proto} {new_rule.get('external_port') or new_rule.get('source_port')}")
     return jsonify(new_rule), 201
 
 
@@ -361,8 +467,9 @@ def api_update_rule(rule_id):
     # endpoint_type itself, delete and recreate the rule - this keeps
     # validation logic in one place (api_add_rule) instead of duplicated.
     allowed_fields = {
-        "proto", "external_port", "internal_port", "comment",
-        "user_id", "user_name", "target_ip", "tunnel_name", "label"
+        "proto", "external_port", "internal_port", "comment", "direction",
+        "user_id", "user_name", "target_ip", "tunnel_name", "label",
+        "source_port", "destination_ip",
     }
     for k, v in data.items():
         if k in allowed_fields:
@@ -418,15 +525,140 @@ def api_active_clients():
 def api_ipsec_tunnels():
     """
     Tunnel list/health as last observed by the daemon (root process - the
-    web UI never shells out to swanctl/ipsec itself). Empty list just
-    means the daemon hasn't seen any StrongSwan connections (or hasn't
-    run yet) - the IPsec endpoint type's tunnel_name field still accepts
-    free text, so this is a convenience suggestion list, not a hard
-    requirement.
+    web UI never shells out to swanctl/ipsec itself).
     """
     status = load_status()
     tunnels = status.get("ipsec_tunnels", {})
     return jsonify([{"name": k, "status": v.get("status", "unknown")} for k, v in tunnels.items()])
+
+
+@app.route("/api/importable-rules")
+@login_required
+def api_importable_rules():
+    """
+    Pre-existing iptables DNAT rules not created by this tool, as last
+    discovered by the daemon. The web UI never reads iptables directly.
+    """
+    status = load_status()
+    return jsonify(status.get("importable", []))
+
+
+@app.route("/api/import-rule", methods=["POST"])
+@login_required
+def api_import_rule():
+    """
+    Queues an import request for the root daemon to actually act on (only
+    the daemon can delete/re-tag real iptables rules). Processed on the
+    daemon's next sync cycle (~10s) - the imported rule then shows up
+    through the normal /api/rules listing, fully editable from then on.
+    """
+    data = request.json or {}
+    rid = str(data.get("id", "")).strip()
+    if not rid:
+        return jsonify(error="id is required"), 400
+
+    requests_list = load_import_requests()
+    if not any(r.get("id") == rid for r in requests_list):
+        requests_list.append({"id": rid, "requested_at": datetime.utcnow().isoformat()})
+        save_import_requests(requests_list)
+    log.info(f"Import requested for foreign rule {rid}")
+    return jsonify(ok=True, message="Import queued — will be applied within ~10s"), 202
+
+
+@app.route("/api/capture/start", methods=["POST"])
+@login_required
+def api_capture_start():
+    """
+    Starts a live tcpdump "peek" for a given rule. Filter fields relevant
+    to the rule itself (target IP, ports, proto) are taken from the rule's
+    own stored definition and the daemon's live status — not from the
+    request body — only the optional narrowing filters (extra_ip/port/
+    proto) come from the browser, and those are validated here AND again
+    by the root daemon before ever reaching tcpdump's argv.
+    """
+    data = request.json or {}
+    rule_id = str(data.get("rule_id", "")).strip()
+    rules = load_rules()
+    rule = next((r for r in rules if r["id"] == rule_id), None)
+    if not rule:
+        return jsonify(error="Rule not found"), 404
+
+    status = load_status()
+    target_ip = status.get("rules", {}).get(rule_id, {}).get("target_ip")
+    if not target_ip:
+        return jsonify(error="This rule has no active target IP right now "
+                              "(offline/disconnected) — nothing to capture"), 400
+
+    direction = rule.get("direction", "inbound")
+    if direction == "inbound":
+        ports = [rule.get("external_port"), rule.get("internal_port")]
+    else:
+        ports = [rule.get("source_port")]
+    ports = [p for p in ports if p]
+
+    extra_ip = str(data.get("extra_ip", "")).strip()
+    extra_port = str(data.get("extra_port", "")).strip()
+    extra_proto = str(data.get("extra_proto", "")).strip().lower()
+
+    if extra_ip and not valid_ip(extra_ip):
+        return jsonify(error="Invalid extra IP filter"), 400
+    if extra_port and not valid_port_spec(extra_port):
+        return jsonify(error="Invalid extra port filter"), 400
+    if extra_proto and extra_proto not in ("tcp", "udp"):
+        return jsonify(error="Extra protocol filter must be tcp or udp"), 400
+
+    session_id = gen_session_id()
+    filt = {
+        "target_ip": target_ip,
+        "proto": rule.get("proto"),
+        "ports": ports,
+        "extra_ip": extra_ip or None,
+        "extra_port": extra_port or None,
+        "extra_proto": extra_proto or None,
+    }
+
+    requests_list = load_capture_requests()
+    requests_list.append({"action": "start", "session_id": session_id, "filter": filt})
+    save_capture_requests(requests_list)
+
+    log.info(f"Capture requested for rule {rule_id} (session {session_id})")
+    return jsonify(session_id=session_id), 202
+
+
+@app.route("/api/capture/<session_id>/log")
+@login_required
+def api_capture_log(session_id):
+    """
+    Polled by the browser (~1s) while the inspect modal is open. Returns
+    a full snapshot rather than an incremental tail — capture sessions are
+    short-lived and filtered, so this stays cheap; this is a live "peek",
+    not a packet-firehose tool.
+    """
+    status = load_capture_status().get(session_id, {})
+    lines = []
+    try:
+        with open(capture_log_path(session_id)) as f:
+            lines = f.readlines()[-500:]
+    except FileNotFoundError:
+        pass
+    return jsonify(
+        state=status.get("state", "unknown"),
+        message=status.get("message", ""),
+        lines=[l.rstrip("\n") for l in lines],
+    )
+
+
+@app.route("/api/capture/stop", methods=["POST"])
+@login_required
+def api_capture_stop():
+    data = request.json or {}
+    session_id = str(data.get("session_id", "")).strip()
+    if not session_id:
+        return jsonify(error="session_id is required"), 400
+    requests_list = load_capture_requests()
+    requests_list.append({"action": "stop", "session_id": session_id})
+    save_capture_requests(requests_list)
+    return jsonify(ok=True)
 
 
 @app.route("/api/change-password", methods=["POST"])

@@ -47,10 +47,10 @@ fi
 log "Installing system dependencies…"
 if [[ $PKG_MGR == "apt-get" ]]; then
   apt-get update -qq
-  apt-get install -y -qq python3 python3-pip python3-venv iptables iptables-persistent || \
-    apt-get install -y -qq python3 python3-pip python3-venv iptables
+  apt-get install -y -qq python3 python3-pip python3-venv iptables iptables-persistent tcpdump || \
+    apt-get install -y -qq python3 python3-pip python3-venv iptables tcpdump
 else
-  $PKG_MGR install -y python3 python3-pip iptables
+  $PKG_MGR install -y python3 python3-pip iptables tcpdump
 fi
 
 # ── Create service user ────────────────────────────────────
@@ -167,6 +167,10 @@ if [[ ! -f "$CONFIG_DIR/env" ]]; then
 RULES_FILE=$CONFIG_DIR/rules.json
 STATUS_FILE=$CONFIG_DIR/status.json
 CONFIG_FILE=$CONFIG_DIR/config.json
+IMPORT_REQUESTS_FILE=$CONFIG_DIR/import_requests.json
+CAPTURE_REQUESTS_FILE=$CONFIG_DIR/capture_requests.json
+CAPTURE_STATUS_FILE=$CONFIG_DIR/capture_status.json
+CAPTURE_LOG_DIR=$CONFIG_DIR/captures
 MONGO_URI=mongodb://localhost:27017/
 MONGO_DB=pritunl
 LISTEN_HOST=127.0.0.1
@@ -176,6 +180,10 @@ POLL_SECS=10
 # Each swanctl/ipsec call spawns a subprocess, so this is checked less
 # often than the main sync loop. Only relevant if you use IPsec-type rules.
 IPSEC_POLL_EVERY=3
+# Safety auto-stop for the tcpdump "Inspect" feature, in case a browser
+# tab is left open/forgotten. Capture sessions stop automatically after
+# this many seconds even without the modal being closed.
+MAX_CAPTURE_SECONDS=600
 EOF
   chown root:root "$CONFIG_DIR/env"
   chmod 640 "$CONFIG_DIR/env"
