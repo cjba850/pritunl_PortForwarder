@@ -14,6 +14,7 @@ Beyond basic forwarding:
 - **Import** of pre-existing iptables port-forward rules already on the host, so they become fully managed by this tool
 - **Live traffic inspection** — peek at a rule's traffic with `tcpdump`, filterable by IP/port/protocol, running only while you have it open
 - **Backup and restore** — export every rule definition to a JSON file, and re-import it later (merge or full replace) with the same validation a hand-added rule goes through
+- **Pause/resume and priority ordering** — take a rule out of effect without deleting it, and reorder rules (which directly controls on-host chain order for outbound rules)
 
 Before any rule is applied, it's checked against ports already in use locally and against pre-existing iptables rules, so it won't silently steal traffic from another service.
 
@@ -225,6 +226,8 @@ Click **Import** on any discovered rule and, within ~10 seconds:
 
 The daemon guesses `endpoint_type` on import: if the rule's target IP matches a *currently connected* Pritunl client's virtual IP, it's imported as a `pritunl` rule; otherwise it's imported as a `static` rule labeled "Imported rule" (you can edit the label afterward). Imported rules always come in as `direction: inbound`, since that's the only thing a `PREROUTING` DNAT rule can represent.
 
+The deletion of the original raw rule is **verified**, not just assumed from `iptables`'s exit code — the daemon re-reads the chain afterward and confirms the line is actually gone before adding the new managed rule. If it's still there (this previously happened, harmlessly but confusingly, when the original rule's comment contained spaces — `"old manual rule"` rather than a single word — and got mangled by a naive whitespace split when reconstructing the delete command), the import is aborted rather than going ahead and creating a second rule that would permanently conflict with the one that was supposed to be replaced. The candidate stays in the Discovered Rules panel with the specific failure reason shown underneath its **Import** button, so it's clear *why* it's still there instead of it just silently reappearing forever — fix the underlying issue (or just remove the original rule manually) and try Import again.
+
 ### Traffic inspection (tcpdump)
 
 Click the **👁** button on any rule to open a live traffic inspector for it. While the modal is open, the daemon runs a `tcpdump` filtered to that rule's target IP/port(s) (plus an optional IP/port/protocol filter you can narrow it with), and the modal polls and displays the latest output roughly once a second.
@@ -264,6 +267,19 @@ Once the underlying conflict clears, the daemon picks the rule back up automatic
 | ○ Tunnel Down | IPsec rule; tunnel not currently up (rule still applied, just won't carry traffic until the tunnel comes up) |
 | ? Tunnel Unknown | IPsec rule; daemon couldn't determine tunnel state (see StrongSwan caveats) |
 | ⚠ Conflict | Rule skipped — collides with a port already in use or an existing non-portfwd iptables rule |
+| ⏸ Paused | Rule is paused — kept configured but not applied to iptables |
+
+### Pausing a rule
+
+Click **⏸** on any rule to take it out of effect without deleting it — its iptables rule(s) are removed within ~10 seconds, but the rule definition (ports, target, comment, everything) stays exactly as configured. Click **▶** to resume it. This is useful for temporarily disabling a forward during maintenance, or for keeping a rule defined-but-dormant without losing its configuration. A paused rule shows up dimmed in the rules table with a **⏸ Paused** badge regardless of what its underlying connection/tunnel state actually is.
+
+### Rule priority / order
+
+The order rules appear in the table **is** their priority — it's the literal order they're stored in `rules.json`, and it's what gets persisted when you reorder. Use **▲ / ▼** on any row to move it up or down.
+
+What this actually changes depends on direction:
+- **Outbound rules** are rebuilt as a group on the host whenever their content *or* relative order changes, specifically so the on-host `POSTROUTING` chain order always matches what's shown in the UI, top to bottom. This matters because POSTROUTING inserts always land at the very top of the chain (see [Outbound rules](#outbound-rules--pinning-a-source-port-snat)) — without enforcing order, the most-recently-changed rule would always end up on top regardless of where you'd placed it.
+- **Inbound rules** don't currently compete for the same traffic — two inbound rules can't have overlapping external ports in the first place (see [Conflict detection](#conflict-detection)) — so reordering them doesn't change applied behavior today. It's still tracked and persisted for clarity/organization, and so it's already in place if a future version ever allows overlapping inbound rules with explicit fallback priority.
 
 ### Editing a rule
 
@@ -357,6 +373,7 @@ Rules are stored as JSON at `/etc/pritunl-portfwd/rules.json`. Every rule has an
     "id": "a1b2c3d4",
     "endpoint_type": "pritunl",
     "direction": "inbound",
+    "enabled": true,
     "user_id": "64f2a1b3c4d5e6f7a8b9c0d1",
     "user_name": "alice",
     "proto": "tcp",
@@ -407,9 +424,9 @@ Rules are stored as JSON at `/etc/pritunl-portfwd/rules.json`. Every rule has an
 
 Note that for `direction: outbound`, `target_ip` identifies the **source** endpoint (the device whose outbound traffic gets pinned), not a forwarding destination — `resolve_target()` in the daemon works identically either way, only the `direction` field changes how the resolved IP is used.
 
-> **Tip:** Changes to the rules file are picked up automatically by the daemon on its next sync cycle. No restart needed.
+> **Tip:** Changes to the rules file are picked up automatically by the daemon on its next sync cycle. No restart needed. The array's order is each rule's priority (see [Rule priority / order](#rule-priority--order)) — editing the file by hand to reorder entries works exactly the same as using the ▲/▼ buttons in the UI.
 
-> **Migrating from an older version:** rules created before endpoint types existed don't have an `endpoint_type` field (treated as `pritunl` automatically), and rules created before ranges/outbound rules existed have plain integer `external_port`/`internal_port` values and no `direction` field (treated as `direction: inbound` automatically). No manual migration needed either way.
+> **Migrating from an older version:** rules created before endpoint types existed don't have an `endpoint_type` field (treated as `pritunl` automatically); rules created before ranges/outbound rules existed have plain integer `external_port`/`internal_port` values and no `direction` field (treated as `direction: inbound` automatically); rules created before pause support existed have no `enabled` field (treated as `true`/active automatically). No manual migration needed for any of this.
 
 ---
 
@@ -578,6 +595,15 @@ The uploaded file is either not a valid JSON export from this tool's **⬇ Expor
 
 ### Import (restore) skipped some rules
 This is expected if those specific rules don't pass the normal validation a hand-added rule would — check the listed reason for each (most commonly: a port conflicts with something that wasn't conflicting when the snapshot was taken, or the file was edited by hand and a port field is malformed). Fix the underlying issue and re-run the import, or add that one rule manually instead.
+
+### An imported rule keeps showing as "⚠ Conflict" against the very rule it replaced
+This was a real bug, fixed by verifying the deletion rather than assuming it worked: if the original foreign rule's comment contained spaces (e.g. `"old manual rule"`), a naive whitespace split used to mangle the reconstructed delete command, so the original rule was silently never actually removed — leaving it and the newly-imported managed rule permanently competing for the same port. If you're seeing this on an existing imported rule from before the fix, delete the duplicate managed rule, then re-click **Import** on the candidate — it'll now show a specific error message under the Import button instead of silently failing if there's still a problem (and the README's [Importing existing iptables rules](#importing-existing-iptables-rules) section explains what changed).
+
+### A paused rule still shows traffic / a resumed rule isn't forwarding yet
+Pause/resume takes effect on the daemon's next sync cycle, same ~10 second window as any other rule change. If a paused rule's iptables entry seems to still be there immediately after pausing, give it a few seconds and check `/etc/pritunl-portfwd/status.json` — the rule's `reason` should read `"paused"` once the daemon has caught up.
+
+### Reordering rules doesn't seem to change anything
+For **inbound** rules, that's expected — see [Rule priority / order](#rule-priority--order); overlapping inbound rules among our own are never allowed, so there's nothing for relative position to change the outcome of. For **outbound** rules, reordering should visibly change the result of `sudo iptables -t nat -S POSTROUTING` within one sync cycle — if it doesn't, check the daemon log for sync errors.
 
 ### IPsec tunnel always shows "? Tunnel Unknown"
 This means the daemon's `swanctl`/`ipsec` parser didn't match your StrongSwan output format — see [IPsec / StrongSwan Integration](#ipsec--strongswan-integration) above for how to diagnose and adjust it. The forwarding rule itself still works regardless of this status display.

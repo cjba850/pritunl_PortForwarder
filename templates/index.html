@@ -227,6 +227,7 @@
     .badge-blue   { background: rgba(88,166,255,.15);  color: var(--blue); }
     .badge-purple { background: rgba(188,140,255,.15); color: var(--purple); }
     .badge-yellow { background: rgba(210,153,34,.15);  color: var(--warn); }
+    .badge-muted  { background: rgba(139,148,158,.15); color: var(--muted); }
 
     .port-arrow { color: var(--muted); margin: 0 4px; }
     .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; }
@@ -506,6 +507,7 @@
       <table>
         <thead>
           <tr>
+            <th title="Priority order — also controls the on-host chain order for outbound rules"></th>
             <th>Endpoint</th>
             <th>Proto</th>
             <th>External Port</th>
@@ -518,7 +520,7 @@
           </tr>
         </thead>
         <tbody id="rules-body">
-          <tr class="empty-row"><td colspan="9">Loading…</td></tr>
+          <tr class="empty-row"><td colspan="10">Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -737,6 +739,9 @@ function subText(r) {
 }
 
 function statusBadge(r) {
+  if (r.enabled === false) {
+    return `<span class="badge badge-muted" title="Rule is paused — kept configured but not applied to iptables">⏸ Paused</span>`;
+  }
   if (r.conflict) {
     return `<span class="badge badge-red" title="${esc(r.conflict)}">⚠ Conflict</span>`;
   }
@@ -823,12 +828,14 @@ async function loadRules() {
   rulesCache = rules;
   const tbody = document.getElementById("rules-body");
   if (!rules.length) {
-    tbody.innerHTML = `<tr class="empty-row"><td colspan="9">No rules defined. Add one above.</td></tr>`;
+    tbody.innerHTML = `<tr class="empty-row"><td colspan="10">No rules defined. Add one above.</td></tr>`;
     return;
   }
-  tbody.innerHTML = rules.map(r => {
+  tbody.innerHTML = rules.map((r, i) => {
     const sub = subText(r);
     const isOutbound = r.direction === "outbound";
+    const isPaused = r.enabled === false;
+    const rowStyle = isPaused ? ' style="opacity:0.55"' : '';
 
     const portCells = isOutbound
       ? `<td colspan="3"><span class="mono">src ${esc(r.source_port || '—')}</span></td>`
@@ -840,7 +847,14 @@ async function loadRules() {
       ? `<span class="mono" style="color:var(--muted);font-size:12px">${r.destination_ip ? '→ ' + esc(r.destination_ip) : '→ any destination'}</span>`
       : `<span class="mono" style="color:var(--muted);font-size:12px">${esc(r.target_ip) || '—'}</span>`;
 
-    return `<tr data-id="${r.id}">
+    const priorityCell = `
+      <button class="btn btn-secondary btn-sm" style="padding:2px 6px"
+              onclick="moveRule('${r.id}','up')" ${i === 0 ? 'disabled' : ''} title="Raise priority">▲</button>
+      <button class="btn btn-secondary btn-sm" style="padding:2px 6px"
+              onclick="moveRule('${r.id}','down')" ${i === rules.length - 1 ? 'disabled' : ''} title="Lower priority">▼</button>`;
+
+    return `<tr data-id="${r.id}"${rowStyle}>
+      <td style="white-space:nowrap">${priorityCell}</td>
       <td>
         <div style="font-weight:500">${esc(displayName(r))}</div>
         <div style="margin-top:3px">${endpointTypeBadge(r.endpoint_type)} ${directionBadge(r)}
@@ -854,6 +868,8 @@ async function loadRules() {
       <td style="color:var(--muted);font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
           title="${esc(r.comment)}">${esc(r.comment || '')}</td>
       <td style="white-space:nowrap">
+        <button class="btn btn-secondary btn-sm" onclick="togglePause('${r.id}', ${isPaused})"
+                title="${isPaused ? 'Resume — start applying this rule again' : 'Pause — keep configured but stop applying to iptables'}">${isPaused ? '▶' : '⏸'}</button>
         <button class="btn btn-secondary btn-sm" onclick="openEditModal('${r.id}')" title="Edit ports/proto/comment">✏️</button>
         <button class="btn btn-secondary btn-sm" onclick="openInspectModal('${r.id}')" title="Peek at live traffic for this rule">👁</button>
         <button class="btn btn-danger" onclick="deleteRule('${r.id}', '${esc(displayName(r))}')"
@@ -952,6 +968,36 @@ async function deleteRule(id, name) {
   const res = await fetch(`/api/rules/${id}`, { method: "DELETE" });
   if (res.ok) loadAll();
   else alert("Failed to delete rule.");
+}
+
+// ── Priority (move up/down) ─────────────────────────────────────────────────
+async function moveRule(id, direction) {
+  const res = await fetch(`/api/rules/${id}/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ direction })
+  });
+  if (res.ok) {
+    loadAll();
+  } else {
+    const data = await res.json();
+    // Already-at-top/bottom isn't worth interrupting the admin for —
+    // the button is disabled in that state anyway in the normal case.
+    if (!/already at the (top|bottom)/i.test(data.error || "")) {
+      alert(data.error || "Failed to move rule.");
+    }
+  }
+}
+
+// ── Pause / resume ───────────────────────────────────────────────────────────
+async function togglePause(id, currentlyPaused) {
+  const res = await fetch(`/api/rules/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ enabled: currentlyPaused })  // currentlyPaused -> resume (true); else pause (false)
+  });
+  if (res.ok) loadAll();
+  else alert("Failed to update rule.");
 }
 
 // ── Export / Import (backup & restore) ──────────────────────────────────────
@@ -1127,7 +1173,10 @@ async function loadImportable() {
         <td><span class="mono">${esc(c.external_port)}</span></td>
         <td style="color:var(--muted)">→</td>
         <td><span class="mono">${esc(c.target_ip)}:${esc(c.internal_port)}</span></td>
-        <td><button class="btn btn-secondary btn-sm" onclick="importRule('${c.id}')">Import</button></td>
+        <td>
+          <button class="btn btn-secondary btn-sm" onclick="importRule('${c.id}')">Import</button>
+          ${c.last_error ? `<div style="color:var(--red);font-size:11px;margin-top:4px;max-width:260px">⚠ ${esc(c.last_error)}</div>` : ''}
+        </td>
       </tr>`).join("");
   } catch (e) { /* daemon not reporting yet — leave card hidden */ }
 }

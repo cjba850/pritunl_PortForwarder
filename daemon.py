@@ -46,17 +46,33 @@ Two more responsibilities:
   this tool and publishes them as "importable" candidates in status.json.
   When the (unprivileged) web UI requests an import, this daemon (root)
   deletes the original raw rule and creates an equivalent managed entry.
+  The deletion is verified (not just assumed from the exit code), and a
+  failure is recorded against that candidate rather than silently leaving
+  two competing rules in place.
 
   Traffic capture - on request (via capture_requests.json, written by the
   unprivileged web UI), spawns a filtered tcpdump for a given rule and
   writes its output to a log file the UI tails. Auto-stops after
   MAX_CAPTURE_SECONDS as a safety net against orphaned captures.
+
+A rule can be paused ("enabled": false) without deleting it - the daemon
+just excludes it from resolution entirely, which naturally tears down
+its iptables rule(s) on the next cycle if it was previously applied.
+
+rules.json's array order is each rule's priority. It's enforced
+differently per direction: inbound rules are still patched incrementally
+(order doesn't change anything there - overlapping inbound rules among
+our own are never allowed), but outbound rules are rebuilt as a whole
+group whenever their content OR relative order changes, since
+POSTROUTING inserts always land at position 1 - that's the only way to
+guarantee the final on-host order actually matches what's shown in the UI.
 """
 
 import os
 import re
 import sys
 import time
+import shlex
 import shutil
 import signal
 import logging
@@ -92,8 +108,24 @@ logging.basicConfig(
 log = logging.getLogger("portfwd-daemon")
 
 running = True
-# rule_id -> {"kind": "inbound"/"outbound", "target_ip": str, "entries": [...]}
-applied_state = {}
+# rule_id -> {"target_ip": str, "entries": [...]} — inbound rules only.
+# Order doesn't matter for inbound (overlapping inbound rules among our
+# own are never allowed at creation time), so this stays a plain dict
+# and is still patched incrementally, same as before.
+applied_inbound = {}
+# Ordered list of (rule_id, proto, source_port_spec, destination_ip,
+# source_ip) tuples, in rules.json priority order — outbound rules only.
+# POSTROUTING inserts always land at position 1, so this group is always
+# rebuilt as a whole whenever its content OR order changes, rather than
+# patched incrementally — that's the only way to guarantee the on-host
+# chain order actually matches the priority order shown in the UI.
+applied_outbound_order = []
+# Foreign-rule signature -> {"reason": str, "at": iso timestamp}, for
+# import attempts that queued successfully but failed to actually remove
+# the original iptables rule. Surfaced on the matching "importable"
+# candidate so it doesn't just look like the import silently did nothing.
+# Pruned in sync() once the underlying foreign rule is no longer present.
+failed_import_signatures = {}
 # session_id -> {"proc": Popen, "started_at": float, "log_path": str, "logf": file}
 active_captures = {}
 
@@ -262,7 +294,20 @@ def parse_importable_rules(foreign_lines):
 def process_import_requests(pritunl_clients):
     """Consumes pending import requests from the web UI: deletes the
     original raw iptables rule and appends a corresponding managed entry
-    to rules.json (picked up by sync() immediately after)."""
+    to rules.json (picked up by sync() immediately after).
+
+    The deletion is verified, not just assumed from the exit code - if
+    the original rule is still present afterward (most commonly: a
+    foreign rule's comment contained spaces and a naive whitespace split
+    mangled the -D arguments), the import is aborted for that rule rather
+    than going ahead and creating a second, now permanently-conflicting
+    managed rule alongside one that was never actually removed. The
+    failure is recorded so it stays visible on that candidate in the
+    Discovered Rules panel instead of just silently reappearing forever
+    with no explanation.
+    """
+    global failed_import_signatures
+
     requests = load_import_requests()
     if not requests:
         return
@@ -282,14 +327,34 @@ def process_import_requests(pritunl_clients):
                         f"iptables rule — dropping request.")
             continue
 
-        del_args = cand["raw"].replace("-A ", "-D ", 1).split()
-        subprocess.run(["iptables", "-t", "nat"] + del_args, capture_output=True)
+        # shlex (not a naive whitespace split) so a quoted multi-word
+        # match value - most commonly --comment "two words" on an old,
+        # hand-added rule - survives being turned back into argv intact,
+        # rather than getting split into several bogus extra arguments.
+        del_args = shlex.split(cand["raw"].replace("-A ", "-D ", 1))
+        del_result = subprocess.run(["iptables", "-t", "nat"] + del_args,
+                                     capture_output=True, text=True)
 
         for fline in foreign_fwd:
             if f"-d {cand['target_ip']}" in fline and "-j ACCEPT" in fline:
-                fdel = fline.replace("-A ", "-D ", 1).split()
+                fdel = shlex.split(fline.replace("-A ", "-D ", 1))
                 subprocess.run(["iptables"] + fdel, capture_output=True)
                 break
+
+        # Don't trust the exit code alone - re-read the chain and confirm
+        # the line is actually gone before treating this as a success.
+        still_present = any(l.strip() == cand["raw"] for l in get_foreign_nat_rules())
+        if still_present:
+            reason = (del_result.stderr or "").strip() or "iptables did not report an error, but the rule is still present"
+            log.error(f"Import of {rid} failed — could not remove the original "
+                      f"iptables rule: {reason}")
+            failed_import_signatures[rid] = {
+                "reason": f"Could not remove the original iptables rule: {reason}",
+                "at": datetime.utcnow().isoformat(),
+            }
+            continue
+
+        failed_import_signatures.pop(rid, None)
 
         user_id = next((uid for uid, vip in pritunl_clients.items()
                          if vip == cand["target_ip"]), None)
@@ -390,7 +455,7 @@ def remove_forward(target_ip, proto, ext_spec, int_spec, rule_id):
         result = subprocess.run(cmd, capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if comment in line:
-                del_args = line.replace("-A ", "-D ", 1).split()
+                del_args = shlex.split(line.replace("-A ", "-D ", 1))
                 full = ["iptables"] + (["-t", table] if table else []) + del_args
                 subprocess.run(full, capture_output=True)
     log.info(f"Removed inbound: {proto} *:{ext_spec} → {target_ip}:{int_spec}  [{comment}]")
@@ -424,29 +489,9 @@ def remove_outbound(source_ip, proto, source_port_spec, destination_ip, rule_id)
                              capture_output=True, text=True)
     for line in result.stdout.splitlines():
         if comment in line:
-            del_args = line.replace("-A ", "-D ", 1).split()
+            del_args = shlex.split(line.replace("-A ", "-D ", 1))
             subprocess.run(["iptables", "-t", "nat"] + del_args, capture_output=True)
     log.info(f"Removed outbound: {source_ip} → {destination_ip or 'any'} [{comment}]")
-
-
-def apply_entry(kind, target_ip, entry, rule_id):
-    proto = entry[0]
-    if kind == "inbound":
-        _, ext_spec, int_spec = entry
-        apply_forward(target_ip, proto, ext_spec, int_spec, rule_id)
-    else:
-        _, src_spec, dest_ip = entry
-        apply_outbound(target_ip, proto, src_spec, dest_ip, rule_id)
-
-
-def remove_entry(kind, target_ip, entry, rule_id):
-    proto = entry[0]
-    if kind == "inbound":
-        _, ext_spec, int_spec = entry
-        remove_forward(target_ip, proto, ext_spec, int_spec, rule_id)
-    else:
-        _, src_spec, dest_ip = entry
-        remove_outbound(target_ip, proto, src_spec, dest_ip, rule_id)
 
 
 def flush_all_portfwd_rules():
@@ -456,7 +501,7 @@ def flush_all_portfwd_rules():
         result = subprocess.run(cmd, capture_output=True, text=True)
         for line in result.stdout.splitlines():
             if COMMENT_PREFIX in line:
-                del_args = line.replace("-A ", "-D ", 1).split()
+                del_args = shlex.split(line.replace("-A ", "-D ", 1))
                 full = ["iptables"] + (["-t", table] if table else []) + del_args
                 subprocess.run(full, capture_output=True)
     log.info("Flush complete.")
@@ -495,18 +540,34 @@ def resolve_target(rule, pritunl_clients, ipsec_status):
 # --------------------------------------------------------------------- #
 
 def sync(rules, pritunl_clients, ipsec_status):
-    global applied_state
+    global applied_inbound, applied_outbound_order, failed_import_signatures
 
     local_ports = get_local_listening_ports()
     foreign_nat = get_foreign_nat_rules()
     importable  = parse_importable_rules(foreign_nat)
 
-    desired   = {}
+    # Prune failure annotations for candidates that are no longer present
+    # at all (resolved some other way since the failure - e.g. removed
+    # manually), then attach any still-relevant annotation.
+    live_ids = {c["id"] for c in importable}
+    failed_import_signatures = {sig: info for sig, info in failed_import_signatures.items()
+                                 if sig in live_ids}
+    for c in importable:
+        if c["id"] in failed_import_signatures:
+            c["last_error"] = failed_import_signatures[c["id"]]["reason"]
+
+    desired = {}                  # rid -> {"kind","target_ip","entries"} — status reporting + inbound application
+    desired_outbound_order = []   # [(rid, proto, src_spec, dest_ip, source_ip), ...] in rules.json priority order
     conflicts = []
     resolved  = {}
 
     for rule in rules:
         rid = rule["id"]
+
+        if not rule.get("enabled", True):
+            resolved[rid] = {"target_ip": None, "active": False, "reason": "paused"}
+            continue
+
         direction = rule.get("direction", "inbound")
         info = resolve_target(rule, pritunl_clients, ipsec_status)
         resolved[rid] = info
@@ -547,34 +608,54 @@ def sync(rules, pritunl_clients, ipsec_status):
                 continue
 
             destination_ip = rule.get("destination_ip") or None
-            entries = [[proto, rule["source_port"], destination_ip]
-                       for proto in expand_protos(rule["proto"])]
+            protos = expand_protos(rule["proto"])
+            entries = [[proto, rule["source_port"], destination_ip] for proto in protos]
             desired[rid] = {"kind": "outbound", "target_ip": info["target_ip"], "entries": entries}
+            for proto in protos:
+                desired_outbound_order.append((rid, proto, rule["source_port"], destination_ip, info["target_ip"]))
 
-    # ---- Removals (stale entries, target IP changed, or kind changed) ----
-    for rid, old in list(applied_state.items()):
+    # ---- Inbound: incremental diff, same as before. Order doesn't
+    # affect correctness here - overlapping inbound rules among our own
+    # are never allowed at creation time, so there's nothing for relative
+    # chain position to change the outcome of. ----
+    for rid, old in list(applied_inbound.items()):
         new = desired.get(rid)
-        changed = (new is None) or (new["target_ip"] != old["target_ip"]) or (new["kind"] != old["kind"])
+        changed = (new is None) or (new["kind"] != "inbound") or (new["target_ip"] != old["target_ip"])
         old_entries = [tuple(e) for e in old["entries"]]
         if changed:
-            for entry in old_entries:
-                remove_entry(old["kind"], old["target_ip"], entry, rid)
+            for proto, ext_spec, int_spec in old_entries:
+                remove_forward(old["target_ip"], proto, ext_spec, int_spec, rid)
         else:
             new_set = set(tuple(e) for e in new["entries"])
-            for entry in old_entries:
-                if entry not in new_set:
-                    remove_entry(old["kind"], old["target_ip"], entry, rid)
+            for proto, ext_spec, int_spec in old_entries:
+                if (proto, ext_spec, int_spec) not in new_set:
+                    remove_forward(old["target_ip"], proto, ext_spec, int_spec, rid)
 
-    # ---- Additions ----
     for rid, info in desired.items():
-        old = applied_state.get(rid)
-        changed = (old is None) or (old["target_ip"] != info["target_ip"]) or (old["kind"] != info["kind"])
+        if info["kind"] != "inbound":
+            continue
+        old = applied_inbound.get(rid)
+        changed = (old is None) or (old["target_ip"] != info["target_ip"])
         old_set = set() if changed else set(tuple(e) for e in old["entries"])
-        for entry in info["entries"]:
-            if tuple(entry) not in old_set:
-                apply_entry(info["kind"], info["target_ip"], entry, rid)
+        for proto, ext_spec, int_spec in info["entries"]:
+            if (proto, ext_spec, int_spec) not in old_set:
+                apply_forward(info["target_ip"], proto, ext_spec, int_spec, rid)
 
-    applied_state = desired
+    applied_inbound = {rid: info for rid, info in desired.items() if info["kind"] == "inbound"}
+
+    # ---- Outbound: order-aware. POSTROUTING inserts always land at
+    # position 1, so the only way to guarantee the on-host chain order
+    # actually matches the priority order shown in the UI is to rebuild
+    # the whole group whenever its content OR order changes, rather than
+    # patch individual entries in place (which would just leave whatever
+    # was most recently (re)applied on top, regardless of intended
+    # priority). ----
+    if desired_outbound_order != applied_outbound_order:
+        for old_rid, proto, src_spec, dest_ip, src_ip in applied_outbound_order:
+            remove_outbound(src_ip, proto, src_spec, dest_ip, old_rid)
+        for new_rid, proto, src_spec, dest_ip, src_ip in reversed(desired_outbound_order):
+            apply_outbound(src_ip, proto, src_spec, dest_ip, new_rid)
+        applied_outbound_order = desired_outbound_order
 
     save_status({
         "updated_at": datetime.utcnow().isoformat(),

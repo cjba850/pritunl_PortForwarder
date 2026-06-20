@@ -247,6 +247,7 @@ def api_get_rules():
     enriched = []
     for rule in rules:
         r = dict(rule)
+        r["enabled"] = rule.get("enabled", True)
         s = status_rules.get(rule["id"], {})
         r["target_ip"] = s.get("target_ip")
         r["active"]    = s.get("applied", False)
@@ -452,6 +453,7 @@ def api_add_rule():
         "id": gen_rule_id(),
         "endpoint_type": etype,
         "direction": direction,
+        "enabled": True,
         "created_at": datetime.utcnow().isoformat(),
         **fields,
     }
@@ -471,29 +473,77 @@ def api_update_rule(rule_id):
     if not target:
         return jsonify(error="Rule not found"), 404
 
-    # endpoint_type and direction are intentionally fixed for the life of
-    # a rule — changing either changes which fields even apply (a totally
-    # different field set), so delete-and-recreate is the supported way
-    # to do that. Everything else (ports, proto, comment, and the
-    # endpoint's own identity fields) goes through the exact same
-    # validation a new rule would, just with this rule excluded from the
-    # overlap/conflict checks so it doesn't flag itself.
-    etype = target["endpoint_type"]
-    direction = target.get("direction", "inbound")
+    # `enabled` (pause/resume) is orthogonal to the rest of a rule's
+    # fields - it doesn't change any port/proto/identity value, just
+    # whether the daemon applies the rule's iptables rule(s) at all - so
+    # it's handled directly rather than going through the heavier
+    # create-style validation below. The common case (the pause/resume
+    # button) sends *only* this field, so that path skips validation
+    # entirely.
+    if "enabled" in data:
+        target["enabled"] = bool(data["enabled"])
 
-    merged = dict(target)
-    merged.update(data)
-    other_rules = [r for r in rules if r["id"] != rule_id]
+    other_keys = set(data.keys()) - {"enabled"}
+    if other_keys:
+        # endpoint_type and direction are intentionally fixed for the
+        # life of a rule — changing either changes which fields even
+        # apply (a totally different field set), so delete-and-recreate
+        # is the supported way to do that. Everything else (ports,
+        # proto, comment, and the endpoint's own identity fields) goes
+        # through the exact same validation a new rule would, just with
+        # this rule excluded from the overlap/conflict checks so it
+        # doesn't flag against its own current values.
+        etype = target["endpoint_type"]
+        direction = target.get("direction", "inbound")
 
-    fields, error, status = _validate_rule_payload(merged, etype, direction, other_rules)
-    if error:
-        return jsonify(error=error), status
+        merged = dict(target)
+        merged.update(data)
+        other_rules = [r for r in rules if r["id"] != rule_id]
 
-    target.update(fields)
+        fields, error, status = _validate_rule_payload(merged, etype, direction, other_rules)
+        if error:
+            return jsonify(error=error), status
+        target.update(fields)
+
     target["updated_at"] = datetime.utcnow().isoformat()
     save_rules(rules)
     log.info(f"Rule updated: {rule_id}")
     return jsonify(target)
+
+
+@app.route("/api/rules/<rule_id>/move", methods=["POST"])
+@login_required
+def api_move_rule(rule_id):
+    """
+    Swaps a rule with its immediate neighbor in rules.json - the array
+    order *is* the priority order. Inbound rules don't currently compete
+    for the same traffic (overlapping inbound rules among our own are
+    never allowed), so this mostly affects organization/clarity for
+    them; for outbound rules it directly controls their relative
+    position in the host's POSTROUTING chain - see daemon.py.
+    """
+    data = request.json or {}
+    move_dir = str(data.get("direction", "")).strip()
+    if move_dir not in ("up", "down"):
+        return jsonify(error="direction must be 'up' or 'down'"), 400
+
+    rules = load_rules()
+    idx = next((i for i, r in enumerate(rules) if r["id"] == rule_id), None)
+    if idx is None:
+        return jsonify(error="Rule not found"), 404
+
+    if move_dir == "up":
+        if idx == 0:
+            return jsonify(error="Rule is already at the top"), 400
+        rules[idx - 1], rules[idx] = rules[idx], rules[idx - 1]
+    else:
+        if idx == len(rules) - 1:
+            return jsonify(error="Rule is already at the bottom"), 400
+        rules[idx + 1], rules[idx] = rules[idx], rules[idx + 1]
+
+    save_rules(rules)
+    log.info(f"Rule {rule_id} moved {move_dir}")
+    return jsonify(ok=True)
 
 
 @app.route("/api/rules/<rule_id>", methods=["DELETE"])
@@ -601,6 +651,7 @@ def api_restore_rules():
             "id": gen_rule_id(),
             "endpoint_type": etype,
             "direction": direction,
+            "enabled": bool(raw.get("enabled", True)),
             "created_at": datetime.utcnow().isoformat(),
             **fields,
         })
